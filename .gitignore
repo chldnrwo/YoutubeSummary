@@ -1,0 +1,16 @@
+# OAuth 시크릿 (절대 커밋 금지!)
+client_secret*.json
+token*.json
+
+# 데이터베이스
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# IDE
+.vscode/
+.idea/
