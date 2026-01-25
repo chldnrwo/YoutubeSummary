@@ -331,31 +331,25 @@ def get_recent_videos(youtube, channel_id: str, days: int = 3):
 # 시스템 프롬프트 정의
 # ============================================================
 SYSTEM_INSTRUCTION = """
-당신은 '기관 투자자'와 '의사결정권자'를 위한 수석 전략가(Chief Strategist)입니다.
-제공된 텍스트를 분석하여, 시장의 흐름과 투자의 기회를 포착하는 심도 있는 [인사이트 리포트]를 작성하세요.
-단순 요약이 아니라, '이면의 함의'와 '인과관계'를 파헤쳐야 합니다.
+당신은 복잡한 콘텐츠에서 **핵심 메시지**를 추출하고 **충분히 상세하게** 정리하는 전문가입니다.
 
-[Guideline]
-- 서론, 인사말 생략. 즉시 본론으로 진입.
-- 톤앤매너: 전문적이고 날카로운 금융 리포트 스타일 (증권사 심층 보고서 톤).
-- '무엇'보다 '왜'와 '그래서 어떻게 될 것인가'에 집중.
+[핵심 원칙]
+- 서론, 인사말 없이 즉시 본론 진입
+- 형식은 완전히 자유롭게, 콘텐츠에 가장 적합한 구조로 정리
+- 중요한 내용은 빠뜨리지 말고 충분히 설명
+- 스크립트가 길면 정리도 그에 비례해서 상세하게 작성
+- 마지막에 핵심 메시지를 한 문장으로 요약
+- **비핵심 내용은 완전히 제외** (오프닝 인사, 구독/좋아요 요청, 광고, 마무리 인사 등)
 
-[CRITICAL: Output Format]
-반드시 아래 JSON 형식으로만 응답하세요:
+[Output Format]
+반드시 아래 JSON 형식으로만 응답:
 
 ```json
 {
-  "title": "영상 내용을 대표하는 간결한 제목 (15자 이내)",
-  "analysis": "전체 분석 내용 (마크다운)"
+  "title": "핵심을 담은 제목 (15자 이내)",
+  "analysis": "분석 내용 (마크다운, 자유 형식)"
 }
 ```
-
-analysis 필드 내용:
-1. **핵심 테제 (Investment Thesis)**: 전체 내용을 관통하는 단 하나의 강력한 메시지 (한 문장).
-2. **시장 메커니즘 및 인과 분석 (Mechanism & Causality)**: [원인 -> 과정 -> 결과] 연결 고리 규명.
-3. **주요 데이터 및 근거 (Key Data & Evidence)**: 구체적 수치나 팩트 나열.
-4. **리스크 및 쟁점 (Risks & Counter-arguments)**: 딜레마, 위험 요인 분석.
-5. **대응 전략 및 시나리오 (Action Plan)**: 포트폴리오 조정 방향, 관망 포인트.
 
 - 언어: 한국어(Korean)
 """
@@ -443,19 +437,51 @@ def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str]:
     response = model.generate_content(prompt)
     
     try:
-        response_text = response.text
-        json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+        response_text = response.text.strip()
+        print(f"[DEBUG] Gemini response (first 500 chars): {response_text[:500]}")
         
+        json_str = None
+        
+        # 1. ```json ... ``` 형식 찾기
+        json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
         if json_match:
-            json_str = json_match.group(1)
-        else:
+            json_str = json_match.group(1).strip()
+        
+        # 2. ``` ... ``` 형식 (언어 없이)
+        if not json_str and '```' in response_text:
+            code_match = re.search(r'```\s*(.*?)\s*```', response_text, re.DOTALL)
+            if code_match:
+                json_str = code_match.group(1).strip()
+        
+        # 3. 중괄호로 시작하면 직접 JSON으로 시도
+        if not json_str and response_text.startswith('{'):
             json_str = response_text
         
-        result = json.loads(json_str)
-        title = result.get('title', '제목 없음')
-        analysis = result.get('analysis', response_text)
-        return title, analysis
-    except (json.JSONDecodeError, AttributeError):
+        # 4. 중괄호가 어딘가에 있으면 추출 시도
+        if not json_str:
+            brace_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if brace_match:
+                json_str = brace_match.group(0)
+        
+        if json_str:
+            result = json.loads(json_str, strict=False)
+            title = result.get('title', '제목 없음')
+            analysis = result.get('analysis', response_text)
+            print(f"[DEBUG] Parsed title: {title}")
+            return title, analysis
+        else:
+            return "분석 완료", response_text
+            
+    except Exception as e:
+        print(f"[DEBUG] JSON parsing error: {e}")
+        # 마지막 시도: 중괄호 찾아서 파싱
+        try:
+            brace_match = re.search(r'\{.*\}', response.text, re.DOTALL)
+            if brace_match:
+                result = json.loads(brace_match.group(0), strict=False)
+                return result.get('title', '제목 없음'), result.get('analysis', response.text)
+        except:
+            pass
         return "분석 완료", response.text
 
 
@@ -653,7 +679,18 @@ def main():
                 
                 st.markdown("---")
                 st.subheader(f"📊 {title}")
-                st.markdown(analysis_result)
+                
+                # JSON이 raw로 반환된 경우 한 번 더 파싱 시도
+                display_result = analysis_result
+                if analysis_result.strip().startswith('{'):
+                    try:
+                        parsed = json.loads(analysis_result)
+                        if 'analysis' in parsed:
+                            display_result = parsed['analysis']
+                    except:
+                        pass
+                
+                st.markdown(display_result)
                 
                 st.download_button(
                     label="📄 Markdown으로 다운로드",
