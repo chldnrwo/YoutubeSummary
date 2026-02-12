@@ -8,6 +8,7 @@ import json
 import sqlite3
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timedelta
 from pathlib import Path
 import streamlit as st
@@ -85,6 +86,13 @@ CONFIG_PATH = BASE_PATH / "config.json"
 
 # OAuth 스코프
 SCOPES = ['https://www.googleapis.com/auth/youtube.readonly']
+
+# ============================================================
+# 병렬 분석 관리 (글로벌)
+# ============================================================
+_analysis_executor = ThreadPoolExecutor(max_workers=3)
+_analysis_status = {}  # {video_id: 'queued'|'running'|'done'|'error'}
+_analysis_lock = threading.Lock()
 
 
 # ============================================================
@@ -511,6 +519,41 @@ def analyze_video(video_id: str, api_key: str) -> tuple[str, str]:
     return title, analysis
 
 
+def submit_analysis(video_id: str, api_key: str):
+    """영상 분석을 ThreadPoolExecutor에 제출합니다."""
+    with _analysis_lock:
+        # 이미 진행 중이거나 완료된 경우 스킵
+        if video_id in _analysis_status:
+            return
+        _analysis_status[video_id] = 'queued'
+    
+    def _run():
+        try:
+            with _analysis_lock:
+                _analysis_status[video_id] = 'running'
+            analyze_video(video_id, api_key)
+            with _analysis_lock:
+                _analysis_status[video_id] = 'done'
+        except Exception as e:
+            with _analysis_lock:
+                _analysis_status[video_id] = 'error'
+            print(f"[ERROR] 분석 실패 ({video_id}): {e}")
+    
+    _analysis_executor.submit(_run)
+
+
+def get_analysis_status(video_id: str) -> str | None:
+    """영상의 분석 상태를 반환합니다."""
+    with _analysis_lock:
+        return _analysis_status.get(video_id)
+
+
+def get_active_analysis_count() -> int:
+    """현재 진행 중인 분석 수를 반환합니다."""
+    with _analysis_lock:
+        return sum(1 for s in _analysis_status.values() if s in ('queued', 'running'))
+
+
 # ============================================================
 # 메인 함수
 # ============================================================
@@ -740,20 +783,15 @@ def main():
     with tab2:
         st.markdown("---")
         
-        # 조회 기간 선택 (캐시 초기화 콜백 포함)
+        # 조회 기간 선택
         col_period, _ = st.columns([1, 4])
         with col_period:
             days_map = {"3일": 3, "7일": 7, "14일": 14, "30일": 30}
             
-            def clear_cache():
-                if 'subscription_videos' in st.session_state:
-                    del st.session_state['subscription_videos']
-            
             selected_label = st.selectbox(
                 "📅 조회 기간",
                 options=list(days_map.keys()),
-                index=0,
-                on_change=clear_cache,
+                index=3,
                 key="days_selector"
             )
             selected_days = days_map[selected_label]
@@ -780,7 +818,8 @@ def main():
                     del st.session_state['subscription_videos']
                 st.rerun()
             
-            # 구독 채널 영상 캐싱
+            # 구독 채널 영상 캐싱 (항상 30일치 가져와서 표시 시 필터링)
+            MAX_FETCH_DAYS = 30
             if 'subscription_videos' not in st.session_state:
                 with st.spinner("📡 구독 채널 영상을 불러오는 중... (처음에는 시간이 걸릴 수 있습니다)"):
                     try:
@@ -789,7 +828,7 @@ def main():
                         
                         progress_bar = st.progress(0)
                         for i, sub in enumerate(subscriptions):
-                            videos = get_recent_videos(youtube, sub['channel_id'], days=selected_days)
+                            videos = get_recent_videos(youtube, sub['channel_id'], days=MAX_FETCH_DAYS)
                             all_videos.extend(videos)
                             progress_bar.progress((i + 1) / len(subscriptions))
                         
@@ -807,42 +846,67 @@ def main():
                             st.error(f"❌ 오류: {error_msg}")
                         st.session_state.pop('subscription_videos', None)
             
-            # 영상 그리드 표시
+            # 영상 그리드 표시 (선택한 기간으로 필터링)
             if 'subscription_videos' in st.session_state:
-                videos = st.session_state['subscription_videos']
+                all_cached_videos = st.session_state['subscription_videos']
+                
+                # 선택한 기간에 맞게 필터링
+                cutoff = datetime.utcnow() - timedelta(days=selected_days)
+                videos = [
+                    v for v in all_cached_videos
+                    if datetime.fromisoformat(v['published_at'].replace('Z', '+00:00')).replace(tzinfo=None) >= cutoff
+                ]
                 
                 if not videos:
                     st.info(f"📭 최근 {selected_days}일 내 업로드된 영상이 없습니다.")
                 else:
-                    st.markdown(f"**최근 {selected_days}일 영상: {len(videos)}개**")
+                    # 진행 중인 분석 상태 표시
+                    active_count = get_active_analysis_count()
+                    col_info, col_auto = st.columns([3, 1])
+                    with col_info:
+                        status_text = f"**최근 {selected_days}일 영상: {len(videos)}개**"
+                        if active_count > 0:
+                            status_text += f" &nbsp;|&nbsp; ⏳ 분석 진행 중: {active_count}개"
+                        st.markdown(status_text, unsafe_allow_html=True)
+                    with col_auto:
+                        if active_count > 0:
+                            if st.button("🔄 상태 갱신", key="refresh_status"):
+                                st.rerun()
                     
                     # 3열 그리드
                     cols = st.columns(3)
                     
                     for i, video in enumerate(videos):
                         with cols[i % 3]:
+                            vid = video['video_id']
+                            status = get_analysis_status(vid)
+                            
                             st.image(video['thumbnail'], use_container_width=True)
                             # 제목 2줄 제한 (CSS clamp)
                             st.markdown(f'<div class="video-title">{video["title"]}</div>', unsafe_allow_html=True)
                             st.markdown(f'<div class="video-channel">📺 {video["channel_title"]}</div>', unsafe_allow_html=True)
                             
-                            if st.button("🔍 분석", key=f"analyze_{video['video_id']}"):
-                                if 'api_key' not in st.session_state or not st.session_state['api_key']:
-                                    st.toast("❌ API Key를 먼저 입력하세요.", icon="⚠️")
-                                else:
-                                    # 백그라운드에서 분석 실행
-                                    def run_analysis(vid, api_key):
-                                        try:
-                                            analyze_video(vid, api_key)
-                                        except Exception:
-                                            pass
-                                    
-                                    thread = threading.Thread(
-                                        target=run_analysis,
-                                        args=(video['video_id'], st.session_state['api_key'])
-                                    )
-                                    thread.start()
-                                    st.toast(f"📝 '{video['title'][:20]}...' 분석 시작!", icon="🚀")
+                            # 분석 상태에 따른 버튼 렌더링
+                            if status == 'done':
+                                st.success("✅ 분석 완료")
+                            elif status in ('queued', 'running'):
+                                st.info("⏳ 분석 중...")
+                            elif status == 'error':
+                                st.error("❌ 분석 실패")
+                                if st.button("🔄 재시도", key=f"retry_{vid}"):
+                                    with _analysis_lock:
+                                        _analysis_status.pop(vid, None)
+                                    submit_analysis(vid, st.session_state['api_key'])
+                                    st.toast(f"📝 '{video['title'][:20]}...' 재시도!", icon="🔄")
+                                    st.rerun()
+                            else:
+                                if st.button("🔍 분석", key=f"analyze_{vid}"):
+                                    if 'api_key' not in st.session_state or not st.session_state['api_key']:
+                                        st.toast("❌ API Key를 먼저 입력하세요.", icon="⚠️")
+                                    else:
+                                        submit_analysis(vid, st.session_state['api_key'])
+                                        st.toast(f"📝 '{video['title'][:20]}...' 분석 대기열 추가!", icon="🚀")
+                                        st.rerun()
                             
                             st.markdown("---")
 
