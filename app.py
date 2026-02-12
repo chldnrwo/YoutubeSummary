@@ -81,6 +81,7 @@ BASE_PATH = Path(__file__).parent
 DB_PATH = BASE_PATH / "insights.db"
 CLIENT_SECRET_PATH = BASE_PATH / "client_secret.json"
 TOKEN_PATH = BASE_PATH / "token.json"
+CONFIG_PATH = BASE_PATH / "config.json"
 
 # OAuth 스코프
 SCOPES = ['https://www.googleapis.com/auth/youtube.readonly']
@@ -245,7 +246,7 @@ def get_recent_videos(youtube, channel_id: str, days: int = 3):
     """
     채널의 최근 N일 영상을 가져옵니다.
     playlistItems.list (1유닛) 사용으로 API 할당량 최적화
-    쇼츠(60초 이하) 영상은 제외됩니다.
+    쇼츠(120초 이하) 영상은 제외됩니다.
     """
     try:
         # 1. 채널의 uploads playlist ID 가져오기 (channels.list = 1유닛)
@@ -264,7 +265,7 @@ def get_recent_videos(youtube, channel_id: str, days: int = 3):
         playlist_request = youtube.playlistItems().list(
             part="snippet",
             playlistId=uploads_playlist_id,
-            maxResults=10  # 채널당 최근 10개 (쇼츠 필터링 후 5개 정도)
+            maxResults=50  # 채널당 최근 50개 (쇼츠가 많을 경우 대비)
         )
         playlist_response = playlist_request.execute()
         
@@ -318,8 +319,8 @@ def get_recent_videos(youtube, channel_id: str, days: int = 3):
                     seconds += int(secs.group(1))
                 duration_map[item['id']] = seconds
             
-            # 60초 이하 영상(쇼츠) 제외
-            videos = [v for v in candidate_videos if duration_map.get(v['video_id'], 0) > 60]
+            # 120초 이하 영상(쇼츠) 제외
+            videos = [v for v in candidate_videos if duration_map.get(v['video_id'], 0) > 120]
             return videos
         
         return []
@@ -331,27 +332,43 @@ def get_recent_videos(youtube, channel_id: str, days: int = 3):
 # 시스템 프롬프트 정의
 # ============================================================
 SYSTEM_INSTRUCTION = """
-당신은 복잡한 콘텐츠에서 **핵심 메시지**를 추출하고 **충분히 상세하게** 정리하는 전문가입니다.
+당신은 콘텐츠의 숨겨진 맥락과 디테일을 완벽하게 파악하는 '심층 분석 에디터'입니다.
+단순한 줄거리 요약이 아니라, **핵심 논리와 구체적인 정보가 담긴 '마스터 리포트'**를 작성하십시오.
 
-[핵심 원칙]
-- 서론, 인사말 없이 즉시 본론 진입
-- 형식은 완전히 자유롭게, 콘텐츠에 가장 적합한 구조로 정리
-- 중요한 내용은 빠뜨리지 말고 충분히 설명
-- 스크립트가 길면 정리도 그에 비례해서 상세하게 작성
-- 마지막에 핵심 메시지를 한 문장으로 요약
-- **비핵심 내용은 완전히 제외** (오프닝 인사, 구독/좋아요 요청, 광고, 마무리 인사 등)
+[절대 어기면 안 되는 작성 원칙]
+1. **'추상적인 요약' 금지**: "설명했다", "좋다고 했다"라고 뭉뚱그리지 말고, **"정확히 어떤 방법인지", "구체적인 수치나 예시(고유명사)"**를 명시하십시오.
+2. **Key-Point 중심 재구성**: 영상의 시간 순서(타임라인)를 무시하고, **주제(Topic)별로 내용을 묶어서 논리적으로 재구성**하십시오.
+3. **논리적 완결성**: [배경/문제] → [해결책/핵심주장] → [결과/의의]로 이어지는 흐름을 명확히 하십시오.
+4. **전문적 어조**: "~해요" 같은 구어체 대신, 보고서나 기사 형식의 명료한 문체를 사용하십시오.
 
 [Output Format]
-반드시 아래 JSON 형식으로만 응답:
+반드시 아래 JSON 형식으로만 응답하십시오:
 
-```json
+```
+json
 {
-  "title": "핵심을 담은 제목 (15자 이내)",
-  "analysis": "분석 내용 (마크다운, 자유 형식)"
+  "title": "내용을 관통하는 매력적인 제목",
+  "analysis": "위 작성 원칙에 따라 재구성된 마크다운 포맷의 상세 리포트"
 }
 ```
 
-- 언어: 한국어(Korean)
+[상세 작성 가이드]
+
+📌 핵심 한 줄 요약: 전체 콘텐츠가 전달하려는 궁극적인 메시지
+
+1️⃣ [주제별 소제목]:
+
+배경/상황: (무엇에 대한 이야기인가? 구체적 상황 묘사)
+
+핵심 내용: (How & Why - 구체적인 방법론, 논리, 메커니즘 상세 서술)
+
+주요 포인트: (고유명사, 수치, 핵심 키워드를 포함한 디테일)
+
+💡 Deep Insight: 이 콘텐츠를 통해 얻을 수 있는 통찰이나 실생활 적용점
+
+언어: 한국어(Korean)
+
+스타일: 깊이 있는 매거진 기사 또는 전문 리포트 스타일
 """
 
 
@@ -501,6 +518,20 @@ def main():
     """메인 애플리케이션 로직"""
     init_database()
     
+    # 설정 파일 로드
+    default_api_key = ""
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                default_api_key = config.get("GOOGLE_API_KEY", "")
+        except Exception:
+            pass
+    
+    # 세션 상태에 API 키가 없으면 설정 파일 값 사용
+    if 'api_key' not in st.session_state and default_api_key:
+        st.session_state['api_key'] = default_api_key
+    
     # URL 파라미터에서 OAuth 콜백 처리
     query_params = st.query_params
     if 'code' in query_params:
@@ -524,8 +555,9 @@ def main():
         api_key = st.text_input(
             "🔑 Google API Key",
             type="password",
+            value=st.session_state.get('api_key', default_api_key),
             placeholder="AIza...",
-            help="Google AI Studio에서 발급받은 API Key를 입력하세요."
+            help="Google AI Studio에서 발급받은 API Key를 입력하세요. (config.json에서 자동 로드 가능)"
         )
         
         if api_key:
@@ -708,6 +740,24 @@ def main():
     with tab2:
         st.markdown("---")
         
+        # 조회 기간 선택 (캐시 초기화 콜백 포함)
+        col_period, _ = st.columns([1, 4])
+        with col_period:
+            days_map = {"3일": 3, "7일": 7, "14일": 14, "30일": 30}
+            
+            def clear_cache():
+                if 'subscription_videos' in st.session_state:
+                    del st.session_state['subscription_videos']
+            
+            selected_label = st.selectbox(
+                "📅 조회 기간",
+                options=list(days_map.keys()),
+                index=0,
+                on_change=clear_cache,
+                key="days_selector"
+            )
+            selected_days = days_map[selected_label]
+        
         youtube = get_youtube_client()
         
         if youtube is None:
@@ -739,7 +789,7 @@ def main():
                         
                         progress_bar = st.progress(0)
                         for i, sub in enumerate(subscriptions):
-                            videos = get_recent_videos(youtube, sub['channel_id'], days=3)
+                            videos = get_recent_videos(youtube, sub['channel_id'], days=selected_days)
                             all_videos.extend(videos)
                             progress_bar.progress((i + 1) / len(subscriptions))
                         
@@ -762,9 +812,9 @@ def main():
                 videos = st.session_state['subscription_videos']
                 
                 if not videos:
-                    st.info("📭 최근 3일 내 업로드된 영상이 없습니다.")
+                    st.info(f"📭 최근 {selected_days}일 내 업로드된 영상이 없습니다.")
                 else:
-                    st.markdown(f"**최근 3일 영상: {len(videos)}개**")
+                    st.markdown(f"**최근 {selected_days}일 영상: {len(videos)}개**")
                     
                     # 3열 그리드
                     cols = st.columns(3)
