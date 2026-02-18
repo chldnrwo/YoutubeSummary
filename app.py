@@ -208,10 +208,19 @@ def get_youtube_client():
     
     try:
         creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        
+        # 토큰이 만료되었지만 refresh_token이 있으면 자동 갱신
+        if creds and not creds.valid and creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+            save_credentials(creds)
+        
         if creds and creds.valid:
             return build('youtube', 'v3', credentials=creds)
     except Exception:
-        pass
+        # 갱신 실패 시 (refresh_token 만료 등) 토큰 파일 삭제 → 재로그인 유도
+        if TOKEN_PATH.exists():
+            TOKEN_PATH.unlink()
     
     return None
 
