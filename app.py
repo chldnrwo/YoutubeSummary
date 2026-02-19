@@ -8,6 +8,7 @@ import json
 import sqlite3
 import os
 import threading
+import requests
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,8 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # ============================================================
 # 페이지 설정 (가장 먼저 호출되어야 함)
@@ -94,6 +97,11 @@ _analysis_executor = ThreadPoolExecutor(max_workers=3)
 _analysis_status = {}  # {video_id: 'queued'|'running'|'done'|'error'}
 _analysis_lock = threading.Lock()
 
+# 주식 스케줄러 (글로벌)
+_stock_scheduler = None
+_stock_fetch_status = {}  # {symbol: {'status': str, 'message': str, 'updated_at': str}}
+_stock_fetch_lock = threading.Lock()
+
 
 # ============================================================
 # 데이터베이스 함수
@@ -122,6 +130,39 @@ def init_database():
     
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_video_id ON insights(video_id)
+    """)
+    
+    # 주식 종목 마스터 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            market TEXT DEFAULT 'KRX',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # 일별 시세 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS daily_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            open_price REAL,
+            high_price REAL,
+            low_price REAL,
+            close_price REAL,
+            volume INTEGER,
+            market_cap INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (stock_id) REFERENCES stocks(id),
+            UNIQUE(stock_id, date)
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_stock_date ON daily_prices(stock_id, date)
     """)
     
     conn.commit()
@@ -183,6 +224,329 @@ def delete_insight(insight_id: int):
     
     conn.commit()
     conn.close()
+
+
+# ============================================================
+# 주식 데이터 DB 함수
+# ============================================================
+def get_or_create_stock(symbol: str, name: str) -> int:
+    """종목 코드로 stocks 테이블 조회/생성 후 ID 반환."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id FROM stocks WHERE symbol = ?", (symbol,))
+    row = cursor.fetchone()
+    
+    if row:
+        stock_id = row[0]
+    else:
+        cursor.execute(
+            "INSERT INTO stocks (symbol, name) VALUES (?, ?)",
+            (symbol, name)
+        )
+        conn.commit()
+        stock_id = cursor.lastrowid
+    
+    conn.close()
+    return stock_id
+
+
+def save_daily_prices_bulk(stock_id: int, records: list):
+    """일별 시세 데이터를 벌크로 저장합니다. 중복은 무시합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.executemany("""
+        INSERT OR IGNORE INTO daily_prices
+        (stock_id, date, open_price, high_price, low_price, close_price, volume, market_cap)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, [(stock_id, r['date'], r['open'], r['high'], r['low'], r['close'], r['volume'], r.get('market_cap')) for r in records])
+    
+    conn.commit()
+    inserted = cursor.rowcount
+    conn.close()
+    return inserted
+
+
+def get_watched_stocks():
+    """등록된 관심 종목 목록을 조회합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT s.id, s.symbol, s.name, s.market, s.created_at,
+               MAX(dp.date) as last_date,
+               COUNT(dp.id) as data_count
+        FROM stocks s
+        LEFT JOIN daily_prices dp ON s.id = dp.stock_id
+        GROUP BY s.id
+        ORDER BY s.created_at DESC
+    """)
+    
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def get_daily_prices(stock_id: int, limit: int = 60):
+    """종목의 일별 시세를 최신순으로 조회합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT date, open_price, high_price, low_price, close_price, volume, market_cap
+        FROM daily_prices
+        WHERE stock_id = ?
+        ORDER BY date DESC
+        LIMIT ?
+    """, (stock_id, limit))
+    
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def delete_stock(stock_id: int):
+    """종목과 관련 시세 데이터를 삭제합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("DELETE FROM daily_prices WHERE stock_id = ?", (stock_id,))
+    cursor.execute("DELETE FROM stocks WHERE id = ?", (stock_id,))
+    
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# KRX 종목 목록 (자동완성 검색용)
+# ============================================================
+_krx_stock_list: list[dict] | None = None
+
+
+def load_krx_stock_list() -> list[dict]:
+    """KRX 상장법인 목록을 다운로드하여 캐시합니다."""
+    global _krx_stock_list
+    if _krx_stock_list is not None:
+        return _krx_stock_list
+    
+    try:
+        url = "http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        
+        text = resp.text
+        trs = re.findall(r'<tr[^>]*>(.*?)</tr>', text, re.DOTALL)
+        
+        stocks = []
+        for tr in trs:
+            tds = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.DOTALL)
+            cells = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
+            if len(cells) >= 3 and re.match(r'^[0-9A-Z]{6}$', cells[2]):
+                stocks.append({
+                    'name': cells[0],
+                    'market': cells[1],
+                    'symbol': cells[2],
+                })
+        
+        _krx_stock_list = stocks
+        print(f"[KRX] 종목 목록 로드 완료: {len(stocks)}개")
+        return stocks
+    except Exception as e:
+        print(f"[ERROR] KRX 종목 목록 로드 실패: {e}")
+        return []
+
+
+def search_stocks(query: str, limit: int = 0) -> list[dict]:
+    """종목명 또는 종목코드로 검색합니다."""
+    if not query or len(query) < 1:
+        return []
+    
+    stocks = load_krx_stock_list()
+    query_lower = query.lower()
+    
+    results = []
+    for s in stocks:
+        if query_lower in s['name'].lower() or query_lower in s['symbol']:
+            results.append(s)
+            if limit > 0 and len(results) >= limit:
+                break
+    
+    return results
+
+
+# ============================================================
+# 네이버 금융 데이터 수집 함수
+# ============================================================
+def fetch_naver_stock_name(symbol: str) -> str | None:
+    """네이버 금융에서 종목명을 가져옵니다."""
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={symbol}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        # title 형식: "삼성전자 : Npay 증권" 또는 "삼성전자 : 네이버 금융"
+        match = re.search(r'<title>\s*(.+?)\s*:\s*(?:Npay|네이버)', resp.text)
+        if match:
+            return match.group(1).strip()
+        return None
+    except Exception:
+        return None
+
+
+def fetch_naver_daily_prices(symbol: str, page: int = 1) -> list:
+    """
+    네이버 금융 일별 시세 페이지에서 OHLCV 데이터를 가져옵니다.
+    Returns: [{'date': 'YYYY-MM-DD', 'open': int, 'high': int, 'low': int, 'close': int, 'volume': int}, ...]
+    """
+    try:
+        url = f"https://finance.naver.com/item/sise_day.naver?code={symbol}&page={page}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        text = resp.text
+        records = []
+        
+        # 날짜 위치를 기준으로 텍스트를 행 단위로 분할
+        date_matches = list(re.finditer(r'\d{4}\.\d{2}\.\d{2}', text))
+        
+        for i, dm in enumerate(date_matches):
+            date_str = dm.group()
+            # 이 날짜부터 다음 날짜(또는 끝)까지의 텍스트를 한 행으로 취급
+            start = dm.start()
+            end = date_matches[i + 1].start() if i + 1 < len(date_matches) else start + 600
+            chunk = text[start:end]
+            
+            # 이 행 내 태그 사이의 텍스트 중 순수 숫자(콤마 포함)만 필터
+            all_between = re.findall(r'>([^<]+)<', chunk)
+            nums = [s.strip() for s in all_between if s.strip() and re.match(r'^[\d,]+$', s.strip())]
+            
+            # 순서: [0]=종가, [1]=전일비(스킵), [2]=시가, [3]=고가, [4]=저가, [5]=거래량
+            if len(nums) >= 6:
+                records.append({
+                    'date': date_str.replace('.', '-'),
+                    'close': int(nums[0].replace(',', '')),
+                    'open': int(nums[2].replace(',', '')),
+                    'high': int(nums[3].replace(',', '')),
+                    'low': int(nums[4].replace(',', '')),
+                    'volume': int(nums[5].replace(',', '')),
+                })
+        
+        return records
+    except Exception as e:
+        print(f"[ERROR] 네이버 시세 수집 실패 ({symbol}, page={page}): {e}")
+        return []
+
+
+def fetch_naver_market_cap(symbol: str) -> int | None:
+    """네이버 금융에서 현재 시가총액을 가져옵니다."""
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={symbol}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        # 시가총액 주변에서 숫자 추출 (억원 단위)
+        idx = resp.text.find('시가총액')
+        if idx >= 0:
+            context = resp.text[idx:idx+300]
+            # td 또는 em 내 콤마 포함 숫자 찾기
+            nums = re.findall(r'([\d,]{4,})', context)
+            if nums:
+                cap_str = nums[0].replace(',', '')
+                return int(cap_str) * 100_000_000  # 억원 -> 원
+        return None
+    except Exception:
+        return None
+
+
+def fetch_stock_data(symbol: str, pages: int = 25) -> tuple[str | None, list]:
+    """
+    종목의 일별 시세 데이터를 수집합니다.
+    Returns: (종목명, [시세 레코드 리스트])
+    """
+    name = fetch_naver_stock_name(symbol)
+    if not name:
+        return None, []
+    
+    all_records = []
+    for page in range(1, pages + 1):
+        records = fetch_naver_daily_prices(symbol, page)
+        if not records:
+            break
+        all_records.extend(records)
+        import time
+        time.sleep(0.3)  # 요청 간격
+    
+    # 시가총액은 최신일 데이터에만 추가 (네이버는 현재 시총만 제공)
+    market_cap = fetch_naver_market_cap(symbol)
+    if all_records and market_cap:
+        all_records[0]['market_cap'] = market_cap
+    
+    return name, all_records
+
+
+def scheduled_fetch_all():
+    """등록된 전 종목의 당일 데이터를 자동 수집합니다 (스케줄러용)."""
+    print(f"[SCHEDULER] 자동 수집 시작: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    stocks = get_watched_stocks()
+    
+    for stock in stocks:
+        symbol = stock['symbol']
+        try:
+            with _stock_fetch_lock:
+                _stock_fetch_status[symbol] = {
+                    'status': 'running',
+                    'message': '수집 중...',
+                    'updated_at': datetime.now().strftime('%H:%M:%S')
+                }
+            
+            name, records = fetch_stock_data(symbol, pages=1)  # 최근 1페이지만
+            if records:
+                stock_id = get_or_create_stock(symbol, name or symbol)
+                save_daily_prices_bulk(stock_id, records)
+            
+            with _stock_fetch_lock:
+                _stock_fetch_status[symbol] = {
+                    'status': 'done',
+                    'message': f'{len(records)}건 수집 완료',
+                    'updated_at': datetime.now().strftime('%H:%M:%S')
+                }
+        except Exception as e:
+            with _stock_fetch_lock:
+                _stock_fetch_status[symbol] = {
+                    'status': 'error',
+                    'message': str(e),
+                    'updated_at': datetime.now().strftime('%H:%M:%S')
+                }
+        
+        import time
+        time.sleep(1)  # 종목 간 간격
+    
+    print(f"[SCHEDULER] 자동 수집 완료: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+def init_stock_scheduler():
+    """주식 데이터 자동 수집 스케줄러를 초기화합니다."""
+    global _stock_scheduler
+    if _stock_scheduler is not None:
+        return  # 이미 실행 중
+    
+    _stock_scheduler = BackgroundScheduler()
+    _stock_scheduler.add_job(
+        scheduled_fetch_all,
+        trigger=CronTrigger(day_of_week='mon-fri', hour=18, minute=0),
+        id='stock_daily_fetch',
+        name='일별 주식 데이터 자동 수집',
+        replace_existing=True
+    )
+    _stock_scheduler.start()
+    print("[SCHEDULER] 주식 자동 수집 스케줄러 시작 (평일 18:00)")
 
 
 # ============================================================
@@ -706,8 +1070,11 @@ def main():
                     st.rerun()
             return
     
+    # 주식 스케줄러 시작
+    init_stock_scheduler()
+    
     # 탭 구성
-    tab1, tab2 = st.tabs(["🔗 URL 분석", "📺 구독 피드"])
+    tab1, tab2, tab3 = st.tabs(["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터"])
     
     # ============================================================
     # 탭 1: URL 직접 입력 분석
@@ -918,6 +1285,160 @@ def main():
                                         st.rerun()
                             
                             st.markdown("---")
+    
+    # ============================================================
+    # 탭 3: 주식 데이터
+    # ============================================================
+    with tab3:
+        st.markdown("---")
+        
+        # 종목 추가 영역
+        st.subheader("➕ 종목 추가")
+        
+        search_query = st.text_input(
+            "종목 검색",
+            placeholder="종목명 또는 종목코드 입력 (예: 삼성전자, 005930)",
+            label_visibility="collapsed",
+            key="stock_search_input"
+        )
+        
+        if search_query and len(search_query.strip()) >= 1:
+            query = search_query.strip()
+            
+            # 6자리 숫자 직접 입력 시 바로 추가 가능
+            if re.match(r'^\d{6}$', query):
+                col_direct, col_btn = st.columns([4, 1])
+                with col_direct:
+                    st.info(f"🔢 종목코드 직접 입력: **{query}**")
+                with col_btn:
+                    if st.button("➕ 추가", key="add_direct_btn", use_container_width=True):
+                        with st.spinner(f"🔍 {query} 종목 정보 확인 중..."):
+                            name = fetch_naver_stock_name(query)
+                            if name:
+                                get_or_create_stock(query, name)
+                                st.success(f"✅ {name} ({query}) 등록 완료!")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ 종목코드 {query}을 찾을 수 없습니다.")
+            
+            # 종목명 검색
+            results = search_stocks(query)
+            
+            if results:
+                for r in results:
+                    col_info, col_add = st.columns([4, 1])
+                    with col_info:
+                        market_badge = "🟦 코스피" if r['market'] == "유가증권시장" else "🟩 코스닥"
+                        st.markdown(f"**{r['name']}** ({r['symbol']}) {market_badge}")
+                    with col_add:
+                        if st.button("➕", key=f"add_{r['symbol']}", use_container_width=True):
+                            get_or_create_stock(r['symbol'], r['name'])
+                            st.success(f"✅ {r['name']} ({r['symbol']}) 등록 완료!")
+                            st.rerun()
+            elif not re.match(r'^\d{6}$', query):
+                st.caption("🔍 검색 결과가 없습니다.")
+        
+        st.markdown("---")
+        
+        # 관심 종목 목록
+        st.subheader("📋 관심 종목 목록")
+        watched = get_watched_stocks()
+        
+        if not watched:
+            st.info("📭 등록된 종목이 없습니다. 위에서 종목코드를 추가해주세요.")
+        else:
+            # 스케줄러 상태
+            if _stock_scheduler and _stock_scheduler.running:
+                next_run = _stock_scheduler.get_job('stock_daily_fetch')
+                if next_run and next_run.next_run_time:
+                    st.caption(f"⏰ 다음 자동 수집: {next_run.next_run_time.strftime('%Y-%m-%d %H:%M')} (평일 18:00)")
+            
+            for stock in watched:
+                col_name, col_info, col_fetch, col_del = st.columns([3, 2, 1, 1])
+                
+                with col_name:
+                    st.markdown(f"**{stock['name']}** (`{stock['symbol']}`)")
+                with col_info:
+                    last_date = stock['last_date'] or '-'
+                    data_count = stock['data_count'] or 0
+                    st.caption(f"최근: {last_date} | {data_count}건")
+                with col_fetch:
+                    if st.button("📥", key=f"fetch_{stock['id']}", help="수동 수집"):
+                        with st.spinner(f"📥 {stock['name']} 데이터 수집 중..."):
+                            name, records = fetch_stock_data(stock['symbol'], pages=25)
+                            if records:
+                                inserted = save_daily_prices_bulk(stock['id'], records)
+                                st.toast(f"✅ {stock['name']}: {len(records)}건 수집 완료!", icon="📈")
+                            else:
+                                st.toast(f"⚠️ {stock['name']}: 수집된 데이터가 없습니다.", icon="⚠️")
+                        st.rerun()
+                with col_del:
+                    if st.button("🗑️", key=f"del_stock_{stock['id']}", help="종목 삭제"):
+                        delete_stock(stock['id'])
+                        st.toast(f"🗑️ {stock['name']} 삭제 완료", icon="🗑️")
+                        st.rerun()
+        
+        st.markdown("---")
+        
+        # 데이터 조회 영역
+        st.subheader("📊 데이터 조회")
+        
+        if watched:
+            stock_options = {f"{s['name']} ({s['symbol']})": s for s in watched}
+            selected_stock_label = st.selectbox(
+                "종목 선택",
+                options=list(stock_options.keys()),
+                key="stock_viewer_select"
+            )
+            
+            if selected_stock_label:
+                selected_stock = stock_options[selected_stock_label]
+                
+                col_limit, col_download = st.columns([1, 4])
+                with col_limit:
+                    show_count = st.selectbox("조회 수", [50, 100, 200, 9999], index=0, key="price_limit",
+                                               format_func=lambda x: "전체" if x == 9999 else str(x))
+                
+                prices = get_daily_prices(selected_stock['id'], limit=show_count)
+                
+                if prices:
+                    # 테이블 데이터 구성
+                    table_data = []
+                    for p in prices:
+                        mc = p['market_cap']
+                        mc_str = f"{mc:,.0f}" if mc else "-"
+                        table_data.append({
+                            "날짜": p['date'],
+                            "시가": f"{p['open_price']:,.0f}",
+                            "고가": f"{p['high_price']:,.0f}",
+                            "저가": f"{p['low_price']:,.0f}",
+                            "종가": f"{p['close_price']:,.0f}",
+                            "거래량": f"{p['volume']:,}",
+                            "시가총액": mc_str
+                        })
+                    
+                    st.dataframe(table_data, use_container_width=True, hide_index=True)
+                    
+                    # CSV 다운로드
+                    csv_lines = ["날짜,시가,고가,저가,종가,거래량,시가총액"]
+                    for p in prices:
+                        mc = p['market_cap'] if p['market_cap'] else ''
+                        csv_lines.append(f"{p['date']},{p['open_price']},{p['high_price']},{p['low_price']},{p['close_price']},{p['volume']},{mc}")
+                    csv_content = "\n".join(csv_lines)
+                    
+                    with col_download:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        st.download_button(
+                            label="📄 CSV 다운로드",
+                            data=csv_content,
+                            file_name=f"{selected_stock['symbol']}_prices.csv",
+                            mime="text/csv",
+                            key="csv_download"
+                        )
+                else:
+                    st.info("📭 저장된 시세 데이터가 없습니다. 📥 버튼으로 데이터를 수집해주세요.")
+        else:
+            st.info("📭 종목을 먼저 추가해주세요.")
 
 
 if __name__ == "__main__":

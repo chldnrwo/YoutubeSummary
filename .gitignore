@@ -3,7 +3,7 @@ client_secret*.json
 token*.json
 
 # 데이터베이스
-*.db
+# *.db
 
 # Python
 __pycache__/
