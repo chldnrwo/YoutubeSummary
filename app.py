@@ -165,6 +165,15 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_stock_date ON daily_prices(stock_id, date)
     """)
     
+    # 숨긴 영상 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hidden_videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT NOT NULL UNIQUE,
+            hidden_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
     conn.commit()
     conn.close()
 
@@ -224,6 +233,34 @@ def delete_insight(insight_id: int):
     
     conn.commit()
     conn.close()
+
+
+def hide_video(video_id: str):
+    """영상을 숨김 처리합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO hidden_videos (video_id) VALUES (?)", (video_id,))
+    conn.commit()
+    conn.close()
+
+
+def unhide_video(video_id: str):
+    """영상 숨김을 해제합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM hidden_videos WHERE video_id = ?", (video_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_hidden_video_ids() -> set:
+    """숨긴 영상 ID 목록을 반환합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT video_id FROM hidden_videos")
+    result = {row[0] for row in cursor.fetchall()}
+    conn.close()
+    return result
 
 
 # ============================================================
@@ -723,15 +760,12 @@ SYSTEM_INSTRUCTION = """
 4. **전문적 어조**: "~해요" 같은 구어체 대신, 보고서나 기사 형식의 명료한 문체를 사용하십시오.
 
 [Output Format]
-반드시 아래 JSON 형식으로만 응답하십시오:
+반드시 아래 JSON 형식으로만 응답하십시오. 코드 블록 없이 순수 JSON만 출력하십시오:
 
-```
-json
 {
   "title": "내용을 관통하는 매력적인 제목",
   "analysis": "위 작성 원칙에 따라 재구성된 마크다운 포맷의 상세 리포트"
 }
-```
 
 [상세 작성 가이드]
 
@@ -850,6 +884,10 @@ def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str]:
             code_match = re.search(r'```\s*(.*?)\s*```', response_text, re.DOTALL)
             if code_match:
                 json_str = code_match.group(1).strip()
+        
+        # 2-1. json_str 앞에 'json' 키워드가 남아있으면 제거
+        if json_str and json_str.startswith('json'):
+            json_str = json_str[4:].strip()
         
         # 3. 중괄호로 시작하면 직접 JSON으로 시도
         if not json_str and response_text.startswith('{'):
@@ -1041,6 +1079,20 @@ def main():
         
         if insight:
             title = insight['title'] if insight['title'] else "분석 결과"
+            display_analysis = insight['analysis_result']
+            
+            # 저장된 analysis_result가 raw JSON이면 파싱하여 표시
+            raw = display_analysis.strip()
+            if raw.startswith('{'):
+                try:
+                    parsed = json.loads(raw, strict=False)
+                    if isinstance(parsed, dict):
+                        if 'analysis' in parsed:
+                            display_analysis = parsed['analysis']
+                        if 'title' in parsed and title in ("분석 완료", "분석 결과", "제목 없음"):
+                            title = parsed['title']
+                except Exception:
+                    pass
             
             # 상단: 제목 + 썸네일 (비율 조정: [2, 1] = 큰 썸네일, [3, 1] = 작은 썸네일)
             col_title, col_thumb = st.columns([2, 1])
@@ -1054,7 +1106,7 @@ def main():
                 st.image(thumbnail_url, use_container_width=True)
             
             st.markdown("---")
-            st.markdown(insight['analysis_result'])
+            st.markdown(display_analysis)
             
             col1, col2 = st.columns(2)
             with col1:
@@ -1228,9 +1280,11 @@ def main():
                 
                 # 선택한 기간에 맞게 필터링
                 cutoff = datetime.utcnow() - timedelta(days=selected_days)
+                hidden_ids = get_hidden_video_ids()
                 videos = [
                     v for v in all_cached_videos
                     if datetime.fromisoformat(v['published_at'].replace('Z', '+00:00')).replace(tzinfo=None) >= cutoff
+                    and v['video_id'] not in hidden_ids
                 ]
                 
                 if not videos:
@@ -1276,12 +1330,19 @@ def main():
                                     st.toast(f"📝 '{video['title'][:20]}...' 재시도!", icon="🔄")
                                     st.rerun()
                             else:
-                                if st.button("🔍 분석", key=f"analyze_{vid}"):
-                                    if 'api_key' not in st.session_state or not st.session_state['api_key']:
-                                        st.toast("❌ API Key를 먼저 입력하세요.", icon="⚠️")
-                                    else:
-                                        submit_analysis(vid, st.session_state['api_key'])
-                                        st.toast(f"📝 '{video['title'][:20]}...' 분석 대기열 추가!", icon="🚀")
+                                btn_col1, btn_col2 = st.columns([3, 1])
+                                with btn_col1:
+                                    if st.button("🔍 분석", key=f"analyze_{vid}", use_container_width=True):
+                                        if 'api_key' not in st.session_state or not st.session_state['api_key']:
+                                            st.toast("❌ API Key를 먼저 입력하세요.", icon="⚠️")
+                                        else:
+                                            submit_analysis(vid, st.session_state['api_key'])
+                                            st.toast(f"📝 '{video['title'][:20]}...' 분석 대기열 추가!", icon="🚀")
+                                            st.rerun()
+                                with btn_col2:
+                                    if st.button("🙈", key=f"hide_{vid}", help="이 영상 숨기기"):
+                                        hide_video(vid)
+                                        st.toast(f"🙈 '{video['title'][:20]}...' 숨김 처리!", icon="👁️")
                                         st.rerun()
                             
                             st.markdown("---")
