@@ -1084,15 +1084,36 @@ def main():
             # 저장된 analysis_result가 raw JSON이면 파싱하여 표시
             raw = display_analysis.strip()
             if raw.startswith('{'):
+                parsed_ok = False
+                # 1차: json.loads 시도
                 try:
                     parsed = json.loads(raw, strict=False)
                     if isinstance(parsed, dict):
                         if 'analysis' in parsed:
                             display_analysis = parsed['analysis']
+                            parsed_ok = True
                         if 'title' in parsed and title in ("분석 완료", "분석 결과", "제목 없음"):
                             title = parsed['title']
                 except Exception:
                     pass
+                
+                # 2차: json.loads 실패 시 정규식으로 추출
+                if not parsed_ok:
+                    # "analysis": "..." 패턴에서 값 추출
+                    analysis_match = re.search(r'"analysis"\s*:\s*"(.*)"', raw, re.DOTALL)
+                    if analysis_match:
+                        display_analysis = analysis_match.group(1)
+                        # JSON 이스케이프 해제
+                        display_analysis = display_analysis.replace('\\"', '"')
+                    
+                    if title in ("분석 완료", "분석 결과", "제목 없음"):
+                        title_match = re.search(r'"title"\s*:\s*"([^"]*)"', raw)
+                        if title_match:
+                            title = title_match.group(1)
+                
+                # literal \n을 실제 줄바꿈으로 변환
+                if '\\n' in display_analysis:
+                    display_analysis = display_analysis.replace('\\n', '\n')
             
             # 상단: 제목 + 썸네일 (비율 조정: [2, 1] = 큰 썸네일, [3, 1] = 작은 썸네일)
             col_title, col_thumb = st.columns([2, 1])
