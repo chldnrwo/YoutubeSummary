@@ -1435,6 +1435,32 @@ def main():
                 if next_run and next_run.next_run_time:
                     st.caption(f"⏰ 다음 자동 수집: {next_run.next_run_time.strftime('%Y-%m-%d %H:%M')} (평일 18:00)")
             
+            # 전체 수동 수집 버튼
+            if st.button("📥 전체 수동 수집", key="fetch_all_stocks", help="모든 관심 종목 데이터를 한번에 수집합니다"):
+                progress_bar = st.progress(0, text="전체 수집 준비 중...")
+                success_count = 0
+                fail_count = 0
+                for idx, stock in enumerate(watched):
+                    progress_bar.progress(
+                        (idx) / len(watched),
+                        text=f"📥 {stock['name']} ({idx+1}/{len(watched)}) 수집 중..."
+                    )
+                    try:
+                        name, records = fetch_stock_data(stock['symbol'], pages=25)
+                        if records:
+                            save_daily_prices_bulk(stock['id'], records)
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    except Exception:
+                        fail_count += 1
+                progress_bar.progress(1.0, text="✅ 전체 수집 완료!")
+                result_msg = f"✅ 전체 수집 완료: 성공 {success_count}개"
+                if fail_count > 0:
+                    result_msg += f", 실패 {fail_count}개"
+                st.toast(result_msg, icon="📈")
+                st.rerun()
+            
             for stock in watched:
                 col_name, col_info, col_fetch, col_del = st.columns([3, 2, 1, 1])
                 
