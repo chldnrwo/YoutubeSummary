@@ -15,6 +15,7 @@ from pathlib import Path
 import streamlit as st
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import WebshareProxyConfig
 
 # YouTube API imports
 from google.oauth2.credentials import Credentials
@@ -804,51 +805,128 @@ def extract_video_id(url: str) -> str | None:
     return None
 
 
-def get_transcript(video_id: str) -> str:
-    """YouTube 영상에서 자막을 추출합니다."""
+# 자막 요청 쓰로틀링을 위한 글로벌 변수
+_last_transcript_request_time = 0
+_transcript_request_lock = threading.Lock()
+
+
+def _get_proxy_config():
+    """config.json에서 프록시 설정을 읽어 반환합니다."""
     try:
-        ytt_api = YouTubeTranscriptApi()
-        
-        # 사용 가능한 자막 목록 가져오기
-        transcript_list = ytt_api.list(video_id)
-        
-        # 우선순위: 한국어 수동 → 영어 수동 → 한국어 자동생성 → 영어 자동생성 → 아무거나
-        selected_transcript = None
-        
-        # 1. 수동 생성 자막 먼저 시도
-        for transcript in transcript_list:
-            if not transcript.is_generated:
-                if transcript.language_code in ['ko', 'ko-KR']:
-                    selected_transcript = transcript
-                    break
-                elif transcript.language_code in ['en', 'en-US'] and not selected_transcript:
-                    selected_transcript = transcript
-        
-        # 2. 자동 생성 자막 시도
-        if not selected_transcript:
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, 'r') as f:
+                config = json.load(f)
+            proxy_cfg = config.get('WEBSHARE_PROXY', {})
+            if proxy_cfg.get('enabled') and proxy_cfg.get('username') and proxy_cfg.get('password'):
+                return WebshareProxyConfig(
+                    proxy_username=proxy_cfg['username'],
+                    proxy_password=proxy_cfg['password'],
+                )
+    except Exception as e:
+        print(f"[PROXY] 프록시 설정 로드 실패, 직접 연결 사용: {e}")
+    return None
+
+
+def _get_cached_transcript(video_id: str) -> str | None:
+    """DB에 이미 저장된 자막이 있으면 반환합니다 (캐싱)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT transcript FROM insights WHERE video_id = ? AND transcript IS NOT NULL AND transcript != '' LIMIT 1", (video_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            print(f"[CACHE] 자막 캐시 히트: {video_id}")
+            return row[0]
+    except Exception:
+        pass
+    return None
+
+
+def get_transcript(video_id: str) -> str:
+    """YouTube 영상에서 자막을 추출합니다. (프록시 + 쓰로틀링 + 캐싱 + 백오프)"""
+    import time
+    import random
+    
+    # 1단계: DB 캐시 확인 (이미 자막이 있으면 재요청 안 함)
+    cached = _get_cached_transcript(video_id)
+    if cached:
+        return cached
+    
+    # 2단계: 쓰로틀링 - 이전 요청으로부터 최소 2~5초 대기
+    global _last_transcript_request_time
+    with _transcript_request_lock:
+        elapsed = time.time() - _last_transcript_request_time
+        min_delay = random.uniform(2.0, 5.0)
+        if elapsed < min_delay:
+            wait_time = min_delay - elapsed
+            print(f"[THROTTLE] {wait_time:.1f}초 대기 중...")
+            time.sleep(wait_time)
+        _last_transcript_request_time = time.time()
+    
+    # 3단계: 프록시 설정 + 지수 백오프 재시도
+    proxy_config = _get_proxy_config()
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            if proxy_config:
+                ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config)
+                print(f"[PROXY] Webshare 프록시를 통해 자막 요청 (시도 {attempt + 1}/{max_retries})")
+            else:
+                ytt_api = YouTubeTranscriptApi()
+                print(f"[DIRECT] 직접 연결로 자막 요청 (시도 {attempt + 1}/{max_retries})")
+            
+            # 사용 가능한 자막 목록 가져오기
+            transcript_list = ytt_api.list(video_id)
+            
+            # 우선순위: 한국어 수동 → 영어 수동 → 한국어 자동생성 → 영어 자동생성 → 아무거나
+            selected_transcript = None
+            
+            # 1. 수동 생성 자막 먼저 시도
             for transcript in transcript_list:
-                if transcript.is_generated:
+                if not transcript.is_generated:
                     if transcript.language_code in ['ko', 'ko-KR']:
                         selected_transcript = transcript
                         break
                     elif transcript.language_code in ['en', 'en-US'] and not selected_transcript:
                         selected_transcript = transcript
+            
+            # 2. 자동 생성 자막 시도
+            if not selected_transcript:
+                for transcript in transcript_list:
+                    if transcript.is_generated:
+                        if transcript.language_code in ['ko', 'ko-KR']:
+                            selected_transcript = transcript
+                            break
+                        elif transcript.language_code in ['en', 'en-US'] and not selected_transcript:
+                            selected_transcript = transcript
+            
+            # 3. 그래도 없으면 첫 번째 자막
+            if not selected_transcript:
+                for transcript in transcript_list:
+                    selected_transcript = transcript
+                    break
+            
+            if selected_transcript:
+                fetched = selected_transcript.fetch()
+                full_text = " ".join([entry.text for entry in fetched])
+                print(f"[OK] 자막 추출 성공: {video_id} ({selected_transcript.language})")
+                return full_text
+            else:
+                raise Exception("사용 가능한 자막이 없습니다.")
         
-        # 3. 그래도 없으면 첫 번째 자막
-        if not selected_transcript:
-            for transcript in transcript_list:
-                selected_transcript = transcript
-                break
-        
-        if selected_transcript:
-            fetched = selected_transcript.fetch()
-            full_text = " ".join([entry.text for entry in fetched])
-            return full_text
-        else:
-            raise Exception("사용 가능한 자막이 없습니다.")
-        
-    except Exception as e:
-        raise Exception(f"자막 추출 중 오류 발생: {str(e)}")
+        except Exception as e:
+            error_msg = str(e)
+            is_ban_error = any(keyword in error_msg.lower() for keyword in ['blocked', 'ban', '429', 'too many'])
+            
+            if is_ban_error and attempt < max_retries - 1:
+                backoff_time = (2 ** attempt) * random.uniform(1.5, 3.0)
+                print(f"[BACKOFF] IP 차단 감지, {backoff_time:.1f}초 후 재시도... ({error_msg})")
+                time.sleep(backoff_time)
+                continue
+            
+            raise Exception(f"자막 추출 중 오류 발생: {error_msg}")
 
 
 def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str]:
