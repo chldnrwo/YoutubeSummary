@@ -76,6 +76,11 @@ st.markdown("""
         overflow: hidden;
         text-overflow: ellipsis;
     }
+    /* 썸네일 이미지 비율 고정 (스크롤 튐 방지) */
+    [data-testid="stImage"] img {
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -112,6 +117,17 @@ def init_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
+    # 사용자 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL UNIQUE,
+            name TEXT,
+            profile_image TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insights (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,12 +136,23 @@ def init_database():
             title TEXT,
             transcript TEXT,
             analysis_result TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
     try:
         cursor.execute("ALTER TABLE insights ADD COLUMN title TEXT")
+    except sqlite3.OperationalError:
+        pass
+    
+    try:
+        cursor.execute("ALTER TABLE insights ADD COLUMN user_id INTEGER REFERENCES users(id)")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        cursor.execute("ALTER TABLE insights ADD COLUMN published_at TIMESTAMP")
     except sqlite3.OperationalError:
         pass
     
@@ -137,11 +164,23 @@ def init_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS stocks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
             name TEXT NOT NULL,
             market TEXT DEFAULT 'KRX',
+            user_id INTEGER REFERENCES users(id),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+    
+    try:
+        cursor.execute("ALTER TABLE stocks ADD COLUMN user_id INTEGER REFERENCES users(id)")
+    except sqlite3.OperationalError:
+        pass
+    
+    # stocks UNIQUE 제약 변경: (symbol) -> (symbol, user_id) 조합으로 중복 방지
+    # SQLite는 ALTER로 제약 변경 불가하므로 인덱스로 대체
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_user_symbol ON stocks(symbol, user_id)
     """)
     
     # 일별 시세 테이블
@@ -170,40 +209,114 @@ def init_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS hidden_videos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            video_id TEXT NOT NULL UNIQUE,
+            video_id TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id),
             hidden_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
+    try:
+        cursor.execute("ALTER TABLE hidden_videos ADD COLUMN user_id INTEGER REFERENCES users(id)")
+    except sqlite3.OperationalError:
+        pass
     
     conn.commit()
     conn.close()
 
 
-def save_insight(video_id: str, video_url: str, title: str, transcript: str, analysis_result: str):
+def upsert_user(channel_id: str, name: str = None, profile_image: str = None) -> int:
+    """사용자를 등록하거나 기존 사용자 ID를 반환합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id FROM users WHERE channel_id = ?", (channel_id,))
+    row = cursor.fetchone()
+    
+    if row:
+        user_id = row[0]
+        # 이름/프로필 이미지 업데이트
+        if name or profile_image:
+            cursor.execute(
+                "UPDATE users SET name = COALESCE(?, name), profile_image = COALESCE(?, profile_image) WHERE id = ?",
+                (name, profile_image, user_id)
+            )
+            conn.commit()
+    else:
+        cursor.execute(
+            "INSERT INTO users (channel_id, name, profile_image) VALUES (?, ?, ?)",
+            (channel_id, name, profile_image)
+        )
+        conn.commit()
+        user_id = cursor.lastrowid
+        
+        # 최초 사용자: 기존 user_id=NULL 데이터 마이그레이션
+        cursor.execute("UPDATE insights SET user_id = ? WHERE user_id IS NULL", (user_id,))
+        cursor.execute("UPDATE stocks SET user_id = ? WHERE user_id IS NULL", (user_id,))
+        cursor.execute("UPDATE hidden_videos SET user_id = ? WHERE user_id IS NULL", (user_id,))
+        conn.commit()
+        print(f"[USER] 신규 등록 + 기존 데이터 마이그레이션: {name} ({channel_id})")
+    
+    conn.close()
+    return user_id
+
+
+def get_current_user_info(youtube) -> dict | None:
+    """로그인된 YouTube 계정의 사용자 정보를 가져와 DB에 저장/반환합니다."""
+    try:
+        response = youtube.channels().list(part="snippet", mine=True).execute()
+        if not response.get('items'):
+            return None
+        
+        channel = response['items'][0]
+        channel_id = channel['id']
+        name = channel['snippet']['title']
+        profile_image = channel['snippet']['thumbnails'].get('default', {}).get('url', '')
+        
+        user_id = upsert_user(channel_id, name, profile_image)
+        return {
+            'user_id': user_id,
+            'channel_id': channel_id,
+            'name': name,
+            'profile_image': profile_image
+        }
+    except Exception as e:
+        print(f"[ERROR] 사용자 정보 조회 실패: {e}")
+        return None
+
+
+def save_insight(video_id: str, video_url: str, title: str, transcript: str, analysis_result: str, user_id: int = None, published_at: str = None):
     """분석 결과를 데이터베이스에 저장합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute("""
-        INSERT INTO insights (video_id, video_url, title, transcript, analysis_result)
-        VALUES (?, ?, ?, ?, ?)
-    """, (video_id, video_url, title, transcript, analysis_result))
+        INSERT INTO insights (video_id, video_url, title, transcript, analysis_result, user_id, published_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (video_id, video_url, title, transcript, analysis_result, user_id, published_at))
     
     conn.commit()
     conn.close()
 
 
-def get_all_insights():
-    """저장된 모든 분석 결과를 조회합니다."""
+def get_all_insights(user_id: int = None):
+    """저장된 분석 결과를 조회합니다. user_id가 주어지면 해당 사용자 것만."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    cursor.execute("""
-        SELECT id, video_id, video_url, title, analysis_result, created_at
-        FROM insights
-        ORDER BY created_at DESC
-    """)
+    if user_id is not None:
+        cursor.execute("""
+            SELECT id, video_id, video_url, title, analysis_result, created_at, published_at
+            FROM insights
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+        """, (user_id,))
+    else:
+        cursor.execute("""
+            SELECT id, video_id, video_url, title, analysis_result, created_at, published_at
+            FROM insights
+            ORDER BY created_at DESC
+        """)
     
     results = cursor.fetchall()
     conn.close()
@@ -236,29 +349,35 @@ def delete_insight(insight_id: int):
     conn.close()
 
 
-def hide_video(video_id: str):
+def hide_video(video_id: str, user_id: int = None):
     """영상을 숨김 처리합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO hidden_videos (video_id) VALUES (?)", (video_id,))
+    cursor.execute("INSERT OR IGNORE INTO hidden_videos (video_id, user_id) VALUES (?, ?)", (video_id, user_id))
     conn.commit()
     conn.close()
 
 
-def unhide_video(video_id: str):
+def unhide_video(video_id: str, user_id: int = None):
     """영상 숨김을 해제합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM hidden_videos WHERE video_id = ?", (video_id,))
+    if user_id is not None:
+        cursor.execute("DELETE FROM hidden_videos WHERE video_id = ? AND user_id = ?", (video_id, user_id))
+    else:
+        cursor.execute("DELETE FROM hidden_videos WHERE video_id = ?", (video_id,))
     conn.commit()
     conn.close()
 
 
-def get_hidden_video_ids() -> set:
+def get_hidden_video_ids(user_id: int = None) -> set:
     """숨긴 영상 ID 목록을 반환합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT video_id FROM hidden_videos")
+    if user_id is not None:
+        cursor.execute("SELECT video_id FROM hidden_videos WHERE user_id = ?", (user_id,))
+    else:
+        cursor.execute("SELECT video_id FROM hidden_videos")
     result = {row[0] for row in cursor.fetchall()}
     conn.close()
     return result
@@ -267,20 +386,23 @@ def get_hidden_video_ids() -> set:
 # ============================================================
 # 주식 데이터 DB 함수
 # ============================================================
-def get_or_create_stock(symbol: str, name: str) -> int:
+def get_or_create_stock(symbol: str, name: str, user_id: int = None) -> int:
     """종목 코드로 stocks 테이블 조회/생성 후 ID 반환."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    cursor.execute("SELECT id FROM stocks WHERE symbol = ?", (symbol,))
+    if user_id is not None:
+        cursor.execute("SELECT id FROM stocks WHERE symbol = ? AND user_id = ?", (symbol, user_id))
+    else:
+        cursor.execute("SELECT id FROM stocks WHERE symbol = ? AND user_id IS NULL", (symbol,))
     row = cursor.fetchone()
     
     if row:
         stock_id = row[0]
     else:
         cursor.execute(
-            "INSERT INTO stocks (symbol, name) VALUES (?, ?)",
-            (symbol, name)
+            "INSERT INTO stocks (symbol, name, user_id) VALUES (?, ?, ?)",
+            (symbol, name, user_id)
         )
         conn.commit()
         stock_id = cursor.lastrowid
@@ -306,21 +428,33 @@ def save_daily_prices_bulk(stock_id: int, records: list):
     return inserted
 
 
-def get_watched_stocks():
+def get_watched_stocks(user_id: int = None):
     """등록된 관심 종목 목록을 조회합니다."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    cursor.execute("""
-        SELECT s.id, s.symbol, s.name, s.market, s.created_at,
-               MAX(dp.date) as last_date,
-               COUNT(dp.id) as data_count
-        FROM stocks s
-        LEFT JOIN daily_prices dp ON s.id = dp.stock_id
-        GROUP BY s.id
-        ORDER BY s.created_at DESC
-    """)
+    if user_id is not None:
+        cursor.execute("""
+            SELECT s.id, s.symbol, s.name, s.market, s.created_at,
+                   MAX(dp.date) as last_date,
+                   COUNT(dp.id) as data_count
+            FROM stocks s
+            LEFT JOIN daily_prices dp ON s.id = dp.stock_id
+            WHERE s.user_id = ?
+            GROUP BY s.id
+            ORDER BY s.created_at DESC
+        """, (user_id,))
+    else:
+        cursor.execute("""
+            SELECT s.id, s.symbol, s.name, s.market, s.created_at,
+                   MAX(dp.date) as last_date,
+                   COUNT(dp.id) as data_count
+            FROM stocks s
+            LEFT JOIN daily_prices dp ON s.id = dp.stock_id
+            GROUP BY s.id
+            ORDER BY s.created_at DESC
+        """)
     
     results = cursor.fetchall()
     conn.close()
@@ -999,16 +1133,16 @@ def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str]:
         return "분석 완료", response.text
 
 
-def analyze_video(video_id: str, api_key: str) -> tuple[str, str]:
+def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None) -> tuple[str, str]:
     """영상을 분석하고 결과를 반환합니다."""
     transcript = get_transcript(video_id)
     title, analysis = analyze_with_gemini(transcript, api_key)
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    save_insight(video_id, video_url, title, transcript, analysis)
+    save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at)
     return title, analysis
 
 
-def submit_analysis(video_id: str, api_key: str):
+def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None):
     """영상 분석을 ThreadPoolExecutor에 제출합니다."""
     with _analysis_lock:
         # 이미 진행 중이거나 완료된 경우 스킵
@@ -1020,7 +1154,7 @@ def submit_analysis(video_id: str, api_key: str):
         try:
             with _analysis_lock:
                 _analysis_status[video_id] = 'running'
-            analyze_video(video_id, api_key)
+            analyze_video(video_id, api_key, user_id=user_id, published_at=published_at)
             with _analysis_lock:
                 _analysis_status[video_id] = 'done'
         except Exception as e:
@@ -1042,6 +1176,99 @@ def get_active_analysis_count() -> int:
     with _analysis_lock:
         return sum(1 for s in _analysis_status.values() if s in ('queued', 'running'))
 
+
+# ============================================================
+# UI 컴포넌트 프래그먼트
+# ============================================================
+@st.fragment
+def render_video_card(video: dict, user_id: int):
+    """개별 영상 카드 렌더링 (버튼 클릭 시 해당 카드만 부분 리렌더링됨)"""
+    vid = video['video_id']
+    title = video['title']
+    
+    # 임시 숨김 처리 (전체 페이지 리렌더링 전까지의 UI를 동일한 크기로 유지)
+    if st.session_state.get(f"hidden_local_{vid}", False):
+        st.image(video['thumbnail'], use_container_width=True)
+        
+        pub_at = video.get('published_at', '')
+        pub_str = f" &nbsp;•&nbsp; 📅 {pub_at[:10]}" if pub_at else ""
+        
+        # style 태그를 타이틀 마크다운과 묶어서 (독립된 여백 블록이 생기는 것을 방지)
+        st.markdown(f"""
+        <style>
+            div[data-testid="stImage"]:has(img[src="{video['thumbnail']}"]) {{
+                filter: grayscale(100%) opacity(30%);
+            }}
+        </style>
+        <div class="video-title" style="color:#aaa; text-decoration:line-through;">{title}</div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown(f'<div class="video-channel" style="color:#ccc;">📺 {video["channel_title"]}{pub_str}</div>', unsafe_allow_html=True)
+        
+        # 원본 카드의 버튼 영역과 100% 동일한 기능/옵션의 DOM 요소 배치
+        btn_col1, btn_col2 = st.columns([3, 1])
+        with btn_col1:
+            st.button("🙈 숨김 처리 완료", key=f"d_hidden_{vid}", disabled=True, use_container_width=True)
+        with btn_col2:
+            st.button("🙈", key=f"d_check_{vid}", help="이 영상 숨기기", disabled=True)
+            
+        st.markdown("---")
+        return
+        
+    status = get_analysis_status(vid)
+    
+    pub_at = video.get('published_at', '')
+    pub_str = f" &nbsp;•&nbsp; 📅 {pub_at[:10]}" if pub_at else ""
+    
+    st.image(video['thumbnail'], use_container_width=True)
+    st.markdown(f'<div class="video-title">{title}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="video-channel">📺 {video["channel_title"]}{pub_str}</div>', unsafe_allow_html=True)
+    
+    # 분석 상태에 따른 버튼 렌더링 (모든 상태를 100% 동일한 레이아웃 구조로 맞춰 높이 고정)
+    btn_col1, btn_col2 = st.columns([3, 1])
+    
+    if status == 'done':
+        with btn_col1:
+            st.button("✅ 분석 완료", key=f"d_done_{vid}", disabled=True, use_container_width=True)
+        with btn_col2:
+            st.button("✔️", key=f"d_done_chk_{vid}", disabled=True)
+            
+    elif status in ('queued', 'running'):
+        with btn_col1:
+            st.button("⏳ 분석 중...", key=f"d_run_{vid}", disabled=True, use_container_width=True)
+        with btn_col2:
+            st.button("...", key=f"d_run_chk_{vid}", disabled=True)
+            
+    elif status == 'error':
+        with btn_col1:
+            def on_retry():
+                with _analysis_lock:
+                    _analysis_status.pop(vid, None)
+                submit_analysis(vid, st.session_state.get('api_key', ''), user_id=user_id)
+                st.toast(f"📝 '{title[:20]}...' 재시도!", icon="🔄")
+            st.button("🔄 재시도 (실패)", key=f"retry_{vid}", on_click=on_retry, use_container_width=True)
+        with btn_col2:
+            st.button("❌", key=f"d_err_{vid}", disabled=True)
+            
+    else:
+        with btn_col1:
+            def on_analyze():
+                api_key = st.session_state.get('api_key', '')
+                if not api_key:
+                    st.toast("❌ API Key를 먼저 입력하세요.", icon="⚠️")
+                    return
+                # published_at 값을 전달하여 DB 저장 시 업로드 시간 기록
+                submit_analysis(vid, api_key, user_id=user_id, published_at=video.get('published_at'))
+                st.toast(f"📝 '{title[:20]}...' 분석 대기열 추가!", icon="🚀")
+            st.button("🔍 분석", key=f"analyze_{vid}", on_click=on_analyze, use_container_width=True)
+        with btn_col2:
+            def on_hide():
+                hide_video(vid, user_id=user_id)
+                st.session_state[f"hidden_local_{vid}"] = True
+                st.toast(f"🙈 '{title[:20]}...' 숨김 처리!", icon="👁️")
+            st.button("🙈", key=f"hide_{vid}", help="이 영상 숨기기", on_click=on_hide)
+    
+    st.markdown("---")
 
 # ============================================================
 # 메인 함수
@@ -1078,11 +1305,53 @@ def main():
                 st.error(f"인증 오류: {str(e)}")
     
     # ============================================================
+    # 로그인 상태 확인 + 사용자 정보 로드
+    # ============================================================
+    youtube = get_youtube_client()
+    is_logged_in = youtube is not None
+    user_info = None
+    user_id = None
+    
+    if is_logged_in:
+        # 세션에 캐싱된 사용자 정보 사용 (API 쿠타 절약)
+        if 'user_info' not in st.session_state:
+            user_info = get_current_user_info(youtube)
+            if user_info:
+                st.session_state['user_info'] = user_info
+        else:
+            user_info = st.session_state['user_info']
+        
+        if user_info:
+            user_id = user_info['user_id']
+    
+    # ============================================================
     # 사이드바
     # ============================================================
     with st.sidebar:
-        st.header("⚙️ 설정")
+        # 로그인 상태에 따른 프로필 표시
+        if is_logged_in and user_info:
+            col_profile, col_logout = st.columns([3, 1])
+            with col_profile:
+                st.markdown(f"👤 **{user_info['name']}**")
+            with col_logout:
+                if st.button("🚨", key="logout_btn", help="로그아웃"):
+                    if TOKEN_PATH.exists():
+                        TOKEN_PATH.unlink()
+                    # 세션 초기화
+                    for key in ['user_info', 'subscription_videos']:
+                        st.session_state.pop(key, None)
+                    st.rerun()
+        else:
+            st.info("🔐 로그인하면 구독 피드, 주식 데이터 등\n더 많은 기능을 사용할 수 있습니다.")
+            if CLIENT_SECRET_PATH.exists():
+                flow = get_oauth_flow()
+                if flow:
+                    auth_url, _ = flow.authorization_url(prompt='consent')
+                    st.markdown(f"[🔗 Google 계정으로 로그인]({auth_url})")
+        
         st.markdown("---")
+        
+        st.header("⚙️ 설정")
         
         api_key = st.text_input(
             "🔑 Google API Key",
@@ -1098,49 +1367,56 @@ def main():
         
         st.markdown("---")
         
-        # 저장된 분석 목록
-        col_header, col_refresh = st.columns([5, 1])
-        with col_header:
-            st.header("📚 저장된 분석")
-        with col_refresh:
-            st.markdown("<br>", unsafe_allow_html=True)  # 정렬용
-            if st.button("🔄", key="refresh_insights", help="분석 목록 새로고침"):
-                st.rerun()
-        
-        insights = get_all_insights()
-        
-        if insights:
-            # 페이지네이션: 기본 10개, 더보기 클릭 시 전체
-            SHOW_COUNT = 10  # 기본 표시 개수 (조정 가능)
-            show_all = st.session_state.get('show_all_insights', False)
+        # 저장된 분석 목록 (로그인 시만 표시)
+        if is_logged_in and user_id:
+            col_header, col_refresh = st.columns([5, 1])
+            with col_header:
+                st.header("📚 저장된 분석")
+            with col_refresh:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🔄", key="refresh_insights", help="분석 목록 새로고침"):
+                    st.rerun()
             
-            display_insights = insights if show_all else insights[:SHOW_COUNT]
+            insights = get_all_insights(user_id=user_id)
             
-            for insight in display_insights:
-                col1, col2 = st.columns([5, 1])
-                with col1:
-                    title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
-                    if st.button(f"📄 {title}", key=f"view_{insight['id']}", use_container_width=True):
-                        st.session_state['selected_insight_id'] = insight['id']
-                        st.rerun()
-                with col2:
-                    if st.button("🗑️", key=f"del_{insight['id']}"):
-                        delete_insight(insight['id'])
-                        st.rerun()
-            
-            # 더보기/접기 버튼
-            if len(insights) > SHOW_COUNT:
-                if show_all:
-                    if st.button("📁 접기", key="collapse_insights", use_container_width=True):
-                        st.session_state['show_all_insights'] = False
-                        st.rerun()
-                else:
-                    remaining = len(insights) - SHOW_COUNT
-                    if st.button(f"📂 더보기 (+{remaining}개)", key="expand_insights", use_container_width=True):
-                        st.session_state['show_all_insights'] = True
-                        st.rerun()
-        else:
-            st.caption("저장된 분석이 없습니다.")
+            if insights:
+                SHOW_COUNT = 10
+                show_all = st.session_state.get('show_all_insights', False)
+                display_insights = insights if show_all else insights[:SHOW_COUNT]
+                
+                for insight in display_insights:
+                    col1, col2 = st.columns([5, 1])
+                    with col1:
+                        # 업로드 시각이 존재하면 표시, 아니면 저장 시각
+                        pub_at = insight['published_at']
+                        if pub_at:
+                            date_str = f"📅 {pub_at[:10]}"
+                        else:
+                            date_str = f"💾 {insight['created_at'][:10]}"
+                            
+                        title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
+                        btn_label = f"{date_str} | {title}"
+                        
+                        if st.button(btn_label[:35] + ("..." if len(btn_label) > 35 else ""), key=f"view_{insight['id']}", use_container_width=True):
+                            st.session_state['selected_insight_id'] = insight['id']
+                            st.rerun()
+                    with col2:
+                        if st.button("🗑️", key=f"del_{insight['id']}"):
+                            delete_insight(insight['id'])
+                            st.rerun()
+                
+                if len(insights) > SHOW_COUNT:
+                    if show_all:
+                        if st.button("📁 접기", key="collapse_insights", use_container_width=True):
+                            st.session_state['show_all_insights'] = False
+                            st.rerun()
+                    else:
+                        remaining = len(insights) - SHOW_COUNT
+                        if st.button(f"📂 더보기 (+{remaining}개)", key="expand_insights", use_container_width=True):
+                            st.session_state['show_all_insights'] = True
+                            st.rerun()
+            else:
+                st.caption("저장된 분석이 없습니다.")
         
         st.markdown("---")
         st.caption("Powered by Google Gemini 2.0 Flash")
@@ -1197,7 +1473,10 @@ def main():
             col_title, col_thumb = st.columns([2, 1])
             with col_title:
                 st.subheader(f"📊 {title}")
-                st.caption(f"Video ID: {insight['video_id']} | 생성일: {insight['created_at']}")
+                
+                pub_at = insight['published_at']
+                pub_info = f"업로드: {pub_at[:10]} | " if pub_at else ""
+                st.caption(f"Video ID: {insight['video_id']} | {pub_info}저장: {insight['created_at'][:19]}")
                 st.markdown(f"🔗 [YouTube 링크]({insight['video_url']})")
             with col_thumb:
                 # YouTube 썸네일 자동 생성 (video_id로 URL 생성)
@@ -1222,10 +1501,14 @@ def main():
             return
     
     # 주식 스케줄러 시작
-    init_stock_scheduler()
+    if is_logged_in:
+        init_stock_scheduler()
     
-    # 탭 구성
-    tab1, tab2, tab3 = st.tabs(["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터"])
+    # 탭 구성: 로그인 상태에 따라 분기
+    if is_logged_in:
+        tab1, tab2, tab3 = st.tabs(["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터"])
+    else:
+        tab1 = st.tabs(["🔗 URL 분석"])[0]
     
     # ============================================================
     # 탭 1: URL 직접 입력 분석
@@ -1276,8 +1559,12 @@ def main():
                         st.session_state['api_key']
                     )
                 
-                save_insight(video_id, youtube_url, title, transcript, analysis_result)
-                st.success(f"✅ '{title}' 저장 완료!")
+                # 로그인 상태에서만 DB에 저장
+                if is_logged_in and user_id:
+                    save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=None)
+                    st.success(f"✅ '{title}' 저장 완료!")
+                else:
+                    st.info("💡 로그인하면 분석 결과가 자동 저장됩니다.")
                 
                 st.markdown("---")
                 st.subheader(f"📊 {title}")
@@ -1304,10 +1591,8 @@ def main():
             except Exception as e:
                 st.error(f"❌ 오류: {str(e)}")
     
-    # ============================================================
-    # 탭 2: 구독 피드
-    # ============================================================
-    with tab2:
+    if is_logged_in:
+      with tab2:
         st.markdown("---")
         
         # 조회 기간 선택
@@ -1323,133 +1608,80 @@ def main():
             )
             selected_days = days_map[selected_label]
         
-        youtube = get_youtube_client()
+        # 로그인 완료 - 구독 채널 영상 표시
+        st.success("✅ YouTube 연결됨")
         
-        if youtube is None:
-            # 로그인 필요
-            st.info("🔐 구독 채널의 영상을 보려면 YouTube 로그인이 필요합니다.")
-            
-            if not CLIENT_SECRET_PATH.exists():
-                st.error("❌ client_secret.json 파일이 없습니다.")
-            else:
-                flow = get_oauth_flow()
-                if flow:
-                    auth_url, _ = flow.authorization_url(prompt='consent')
-                    st.markdown(f"[🔗 Google 계정으로 로그인]({auth_url})")
-        else:
-            # 로그인 완료 - 구독 채널 영상 표시
-            st.success("✅ YouTube 연결됨")
-            
-            if st.button("🔄 새로고침"):
-                if 'subscription_videos' in st.session_state:
-                    del st.session_state['subscription_videos']
-                st.rerun()
-            
-            # 구독 채널 영상 캐싱 (항상 30일치 가져와서 표시 시 필터링)
-            MAX_FETCH_DAYS = 30
-            if 'subscription_videos' not in st.session_state:
-                with st.spinner("📡 구독 채널 영상을 불러오는 중... (처음에는 시간이 걸릴 수 있습니다)"):
-                    try:
-                        subscriptions = get_subscriptions(youtube)
-                        all_videos = []
-                        
-                        progress_bar = st.progress(0)
-                        for i, sub in enumerate(subscriptions):
-                            videos = get_recent_videos(youtube, sub['channel_id'], days=MAX_FETCH_DAYS)
-                            all_videos.extend(videos)
-                            progress_bar.progress((i + 1) / len(subscriptions))
-                        
-                        progress_bar.empty()
-                        
-                        # 날짜순 정렬
-                        all_videos.sort(key=lambda x: x['published_at'], reverse=True)
-                        st.session_state['subscription_videos'] = all_videos
-                        
-                    except Exception as e:
-                        error_msg = str(e)
-                        if 'quotaExceeded' in error_msg or 'quota' in error_msg.lower():
-                            st.error("❌ API 할당량이 소진되었습니다. 내일 다시 시도해주세요.")
-                        else:
-                            st.error(f"❌ 오류: {error_msg}")
-                        st.session_state.pop('subscription_videos', None)
-            
-            # 영상 그리드 표시 (선택한 기간으로 필터링)
+        if st.button("🔄 새로고침"):
             if 'subscription_videos' in st.session_state:
-                all_cached_videos = st.session_state['subscription_videos']
-                
-                # 선택한 기간에 맞게 필터링
-                cutoff = datetime.utcnow() - timedelta(days=selected_days)
-                hidden_ids = get_hidden_video_ids()
-                videos = [
-                    v for v in all_cached_videos
-                    if datetime.fromisoformat(v['published_at'].replace('Z', '+00:00')).replace(tzinfo=None) >= cutoff
-                    and v['video_id'] not in hidden_ids
-                ]
-                
-                if not videos:
-                    st.info(f"📭 최근 {selected_days}일 내 업로드된 영상이 없습니다.")
-                else:
-                    # 진행 중인 분석 상태 표시
-                    active_count = get_active_analysis_count()
-                    col_info, col_auto = st.columns([3, 1])
-                    with col_info:
-                        status_text = f"**최근 {selected_days}일 영상: {len(videos)}개**"
-                        if active_count > 0:
-                            status_text += f" &nbsp;|&nbsp; ⏳ 분석 진행 중: {active_count}개"
-                        st.markdown(status_text, unsafe_allow_html=True)
-                    with col_auto:
-                        if active_count > 0:
-                            if st.button("🔄 상태 갱신", key="refresh_status"):
-                                st.rerun()
+                del st.session_state['subscription_videos']
+            st.rerun()
+        
+        # 구독 채널 영상 캐싱 (항상 30일치 가져와서 표시 시 필터링)
+        MAX_FETCH_DAYS = 30
+        if 'subscription_videos' not in st.session_state:
+            with st.spinner("📡 구독 채널 영상을 불러오는 중... (처음에는 시간이 걸릴 수 있습니다)"):
+                try:
+                    subscriptions = get_subscriptions(youtube)
+                    all_videos = []
                     
-                    # 3열 그리드
-                    cols = st.columns(3)
+                    progress_bar = st.progress(0)
+                    for i, sub in enumerate(subscriptions):
+                        videos = get_recent_videos(youtube, sub['channel_id'], days=MAX_FETCH_DAYS)
+                        all_videos.extend(videos)
+                        progress_bar.progress((i + 1) / len(subscriptions))
                     
-                    for i, video in enumerate(videos):
-                        with cols[i % 3]:
-                            vid = video['video_id']
-                            status = get_analysis_status(vid)
-                            
-                            st.image(video['thumbnail'], use_container_width=True)
-                            # 제목 2줄 제한 (CSS clamp)
-                            st.markdown(f'<div class="video-title">{video["title"]}</div>', unsafe_allow_html=True)
-                            st.markdown(f'<div class="video-channel">📺 {video["channel_title"]}</div>', unsafe_allow_html=True)
-                            
-                            # 분석 상태에 따른 버튼 렌더링
-                            if status == 'done':
-                                st.success("✅ 분석 완료")
-                            elif status in ('queued', 'running'):
-                                st.info("⏳ 분석 중...")
-                            elif status == 'error':
-                                st.error("❌ 분석 실패")
-                                if st.button("🔄 재시도", key=f"retry_{vid}"):
-                                    with _analysis_lock:
-                                        _analysis_status.pop(vid, None)
-                                    submit_analysis(vid, st.session_state['api_key'])
-                                    st.toast(f"📝 '{video['title'][:20]}...' 재시도!", icon="🔄")
-                                    st.rerun()
-                            else:
-                                btn_col1, btn_col2 = st.columns([3, 1])
-                                with btn_col1:
-                                    if st.button("🔍 분석", key=f"analyze_{vid}", use_container_width=True):
-                                        if 'api_key' not in st.session_state or not st.session_state['api_key']:
-                                            st.toast("❌ API Key를 먼저 입력하세요.", icon="⚠️")
-                                        else:
-                                            submit_analysis(vid, st.session_state['api_key'])
-                                            st.toast(f"📝 '{video['title'][:20]}...' 분석 대기열 추가!", icon="🚀")
-                                            st.rerun()
-                                with btn_col2:
-                                    if st.button("🙈", key=f"hide_{vid}", help="이 영상 숨기기"):
-                                        hide_video(vid)
-                                        st.toast(f"🙈 '{video['title'][:20]}...' 숨김 처리!", icon="👁️")
-                                        st.rerun()
-                            
-                            st.markdown("---")
+                    progress_bar.empty()
+                    
+                    # 날짜순 정렬
+                    all_videos.sort(key=lambda x: x['published_at'], reverse=True)
+                    st.session_state['subscription_videos'] = all_videos
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    if 'quotaExceeded' in error_msg or 'quota' in error_msg.lower():
+                        st.error("❌ API 할당량이 소진되었습니다. 내일 다시 시도해주세요.")
+                    else:
+                        st.error(f"❌ 오류: {error_msg}")
+                    st.session_state.pop('subscription_videos', None)
+        
+        # 영상 그리드 표시 (선택한 기간으로 필터링)
+        if 'subscription_videos' in st.session_state:
+            all_cached_videos = st.session_state['subscription_videos']
+            
+            # 선택한 기간에 맞게 필터링
+            cutoff = datetime.utcnow() - timedelta(days=selected_days)
+            hidden_ids = get_hidden_video_ids(user_id=user_id)
+            videos = [
+                v for v in all_cached_videos
+                if datetime.fromisoformat(v['published_at'].replace('Z', '+00:00')).replace(tzinfo=None) >= cutoff
+                and v['video_id'] not in hidden_ids
+            ]
+            
+            if not videos:
+                st.info(f"📭 최근 {selected_days}일 내 업로드된 영상이 없습니다.")
+            else:
+                # 진행 중인 분석 상태 표시
+                active_count = get_active_analysis_count()
+                col_info, col_auto = st.columns([3, 1])
+                with col_info:
+                    status_text = f"**최근 {selected_days}일 영상: {len(videos)}개**"
+                    if active_count > 0:
+                        status_text += f" &nbsp;|&nbsp; ⏳ 분석 진행 중: {active_count}개"
+                    st.markdown(status_text, unsafe_allow_html=True)
+                with col_auto:
+                    if active_count > 0:
+                        if st.button("🔄 상태 갱신", key="refresh_status"):
+                            st.rerun()
+                
+                # 3열 그리드
+                cols = st.columns(3)
+                
+                for i, video in enumerate(videos):
+                    with cols[i % 3]:
+                        render_video_card(video, user_id)
     
-    # ============================================================
-    # 탭 3: 주식 데이터
-    # ============================================================
-    with tab3:
+    if is_logged_in:
+      with tab3:
         st.markdown("---")
         
         # 종목 추가 영역
@@ -1475,7 +1707,7 @@ def main():
                         with st.spinner(f"🔍 {query} 종목 정보 확인 중..."):
                             name = fetch_naver_stock_name(query)
                             if name:
-                                get_or_create_stock(query, name)
+                                get_or_create_stock(query, name, user_id=user_id)
                                 st.success(f"✅ {name} ({query}) 등록 완료!")
                                 st.rerun()
                             else:
@@ -1492,7 +1724,7 @@ def main():
                         st.markdown(f"**{r['name']}** ({r['symbol']}) {market_badge}")
                     with col_add:
                         if st.button("➕", key=f"add_{r['symbol']}", use_container_width=True):
-                            get_or_create_stock(r['symbol'], r['name'])
+                            get_or_create_stock(r['symbol'], r['name'], user_id=user_id)
                             st.success(f"✅ {r['name']} ({r['symbol']}) 등록 완료!")
                             st.rerun()
             elif not re.match(r'^\d{6}$', query):
@@ -1502,7 +1734,7 @@ def main():
         
         # 관심 종목 목록
         st.subheader("📋 관심 종목 목록")
-        watched = get_watched_stocks()
+        watched = get_watched_stocks(user_id=user_id)
         
         if not watched:
             st.info("📭 등록된 종목이 없습니다. 위에서 종목코드를 추가해주세요.")
