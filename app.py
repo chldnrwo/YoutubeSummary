@@ -219,6 +219,29 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # 숨김 영상 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hidden_videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(video_id, user_id)
+        )
+    """)
+
+    # 생성된 신문 저장 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS newspapers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER REFERENCES users(id),
+            title TEXT,
+            target_period TEXT,
+            content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     
     conn.commit()
     conn.close()
