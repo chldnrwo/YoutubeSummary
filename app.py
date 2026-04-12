@@ -756,15 +756,19 @@ def init_stock_scheduler():
 # ============================================================
 # YouTube OAuth 함수
 # ============================================================
-def get_oauth_flow():
+def get_oauth_flow(redirect_uri=None):
     """OAuth Flow 객체를 생성합니다."""
     if not CLIENT_SECRET_PATH.exists():
         return None
     
+    if redirect_uri is None:
+        # 기본값 (하위 호환성)
+        redirect_uri = 'http://localhost:8501'
+        
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
         scopes=SCOPES,
-        redirect_uri='http://localhost:8501'
+        redirect_uri=redirect_uri
     )
     return flow
 
@@ -1365,12 +1369,21 @@ def main():
     # URL 파라미터에서 OAuth 콜백 처리
     query_params = st.query_params
     if 'code' in query_params:
-        flow = get_oauth_flow()
+        # 현재 접속 호스트 기반으로 Redirect URI 결정
+        host = st.context.headers.get("host", "localhost:8501")
+        redirect_uri = f"http://{host}"
+        
+        flow = get_oauth_flow(redirect_uri=redirect_uri)
         if flow:
             try:
-                flow.fetch_token(code=query_params['code'])
+                # 세션에 저장된 code_verifier 가져오기
+                code_verifier = st.session_state.get('code_verifier')
+                flow.fetch_token(code=query_params['code'], code_verifier=code_verifier)
                 save_credentials(flow.credentials)
                 st.query_params.clear()
+                # 사용한 verifier 제거
+                if 'code_verifier' in st.session_state:
+                    del st.session_state['code_verifier']
                 st.rerun()
             except Exception as e:
                 st.error(f"인증 오류: {str(e)}")
@@ -1420,9 +1433,16 @@ def main():
         
         # 구글 로그인 버튼
         if CLIENT_SECRET_PATH.exists():
-            flow = get_oauth_flow()
+            # 현재 접속 호스트 기반으로 Redirect URI 결정
+            host = st.context.headers.get("host", "localhost:8501")
+            redirect_uri = f"http://{host}"
+            
+            flow = get_oauth_flow(redirect_uri=redirect_uri)
             if flow:
                 auth_url, _ = flow.authorization_url(prompt='consent')
+                # PKCE 검증을 위한 code_verifier 세션 저장 (중요!)
+                st.session_state['code_verifier'] = flow.code_verifier
+                
                 st.markdown(f"""
                 <div style="text-align: center; margin-top: 1rem;">
                     <a href="{auth_url}" target="_self" style="
