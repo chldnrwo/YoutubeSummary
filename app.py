@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timedelta
 from pathlib import Path
 import streamlit as st
+import streamlit.components.v1 as components
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import WebshareProxyConfig
@@ -284,15 +285,15 @@ def get_current_user_info(youtube) -> dict | None:
         return None
 
 
-def save_insight(video_id: str, video_url: str, title: str, transcript: str, analysis_result: str, user_id: int = None, published_at: str = None):
+def save_insight(video_id: str, video_url: str, title: str, transcript: str, analysis_result: str, user_id: int = None, published_at: str = None, category: str = '그 외'):
     """분석 결과를 데이터베이스에 저장합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute("""
-        INSERT INTO insights (video_id, video_url, title, transcript, analysis_result, user_id, published_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (video_id, video_url, title, transcript, analysis_result, user_id, published_at))
+        INSERT INTO insights (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category))
     
     conn.commit()
     conn.close()
@@ -306,17 +307,48 @@ def get_all_insights(user_id: int = None):
     
     if user_id is not None:
         cursor.execute("""
-            SELECT id, video_id, video_url, title, analysis_result, created_at, published_at
+            SELECT id, video_id, video_url, title, analysis_result, created_at, published_at, category
             FROM insights
             WHERE user_id = ?
             ORDER BY created_at DESC
         """, (user_id,))
     else:
         cursor.execute("""
-            SELECT id, video_id, video_url, title, analysis_result, created_at, published_at
+            SELECT id, video_id, video_url, title, analysis_result, created_at, published_at, category
             FROM insights
             ORDER BY created_at DESC
         """)
+    
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def save_newspaper(user_id: int, title: str, target_period: str, content: str):
+    """생성된 신문을 데이터베이스에 저장합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO newspapers (user_id, title, target_period, content)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, title, target_period, content))
+    
+    conn.commit()
+    conn.close()
+
+
+def get_all_newspapers(user_id: int):
+    """저장된 신문 목록을 조회합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT * FROM newspapers
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+    """, (user_id,))
     
     results = cursor.fetchall()
     conn.close()
@@ -899,6 +931,7 @@ SYSTEM_INSTRUCTION = """
 
 {
   "title": "내용을 관통하는 매력적인 제목",
+  "category": "'경제', 'IT', '문화', '그 외' 중 가장 적합한 주제 하나 분류",
   "analysis": "위 작성 원칙에 따라 재구성된 마크다운 포맷의 상세 리포트"
 }
 
@@ -919,6 +952,20 @@ SYSTEM_INSTRUCTION = """
 언어: 한국어(Korean)
 
 스타일: 깊이 있는 매거진 기사 또는 전문 리포트 스타일
+"""
+
+SYSTEM_INSTRUCTION_NEWSPAPER = """
+당신은 방대한 정보들을 엮어 하나의 흐름 있는 완성된 기사로 만들어내는 '수석 편집장'입니다.
+사용자가 제공하는 데이터는 특정 주제(예: 경제, IT 등)로 분류된 개별 분석 리포트들의 모음입니다.
+이 리포트들을 단순 나열하거나 요약하는 것을 넘어, **인터넷 매거진의 한 섹션(특집 기사)을 읽는 것처럼 매끄럽고 흥미로운 하나의 종합 기사 체제로 재구성**하십시오.
+
+[작성 원칙]
+1. 단순 나열 금지 (X 번째 영상에서는~ 금지): 여러 영상의 내용을 관통하는 시대적 흐름이나 핵심 주제를 하나로 꿰어 논리적 서사로 만드십시오.
+2. 소제목 활용: 내용을 3~4개의 소주제로 나누어 독자가 읽기 편하게 구성하십시오.
+3. 도입부와 결론: 기사의 서두에는 전체 상황을 관망하는 인트로를 쓰고, 마지막에는 편집장의 Insight가 담긴 맺음말을 작성하십시오.
+4. 구체성 유지: 원본 자료들에 있는 핵심 수치, 고유명사, 뉘앙스는 절대 잃지 말고 기사 속에 적절히 녹여내십시오.
+
+결과는 반드시 마크다운(Markdown) 포맷으로 아름답게 작성해야 합니다.
 """
 
 
@@ -1114,11 +1161,12 @@ def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str]:
         if json_str:
             result = json.loads(json_str, strict=False)
             title = result.get('title', '제목 없음')
+            category = result.get('category', '그 외')
             analysis = result.get('analysis', response_text)
-            print(f"[DEBUG] Parsed title: {title}")
-            return title, analysis
+            print(f"[DEBUG] Parsed title: {title}, category: {category}")
+            return title, category, analysis
         else:
-            return "분석 완료", response_text
+            return "분석 완료", "그 외", response_text
             
     except Exception as e:
         print(f"[DEBUG] JSON parsing error: {e}")
@@ -1127,19 +1175,42 @@ def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str]:
             brace_match = re.search(r'\{.*\}', response.text, re.DOTALL)
             if brace_match:
                 result = json.loads(brace_match.group(0), strict=False)
-                return result.get('title', '제목 없음'), result.get('analysis', response.text)
+                return result.get('title', '제목 없음'), result.get('category', '그 외'), result.get('analysis', response.text)
         except:
             pass
-        return "분석 완료", response.text
+        return "분석 완료", "그 외", response.text
 
 
-def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None) -> tuple[str, str]:
+def generate_newspaper_section(category: str, insights_text: str, api_key: str) -> str:
+    """여러 분석 결과를 모아 하나의 통합된 기사를 생성합니다."""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name="gemini-2.5-pro",
+        generation_config=genai.GenerationConfig(
+            temperature=0.7,
+            top_p=0.95,
+            max_output_tokens=8192,
+        ),
+        system_instruction=SYSTEM_INSTRUCTION_NEWSPAPER
+    )
+    
+    prompt = f"다음은 '{category}' 분야에 관한 최근 분석 자료들입니다. 이 내용들을 엮어서 하나의 완성된 전문 기사를 작성해주세요:\n\n{insights_text}"
+    
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"[ERROR] 신문 생성 실패: {e}")
+        return f"🚨 기사 작성 중 오류가 발생했습니다: {e}"
+
+
+def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None) -> tuple[str, str, str]:
     """영상을 분석하고 결과를 반환합니다."""
     transcript = get_transcript(video_id)
-    title, analysis = analyze_with_gemini(transcript, api_key)
+    title, category, analysis = analyze_with_gemini(transcript, api_key)
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at)
-    return title, analysis
+    save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at, category=category)
+    return title, category, analysis
 
 
 def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None):
@@ -1190,8 +1261,8 @@ def render_video_card(video: dict, user_id: int):
     if st.session_state.get(f"hidden_local_{vid}", False):
         st.image(video['thumbnail'], use_container_width=True)
         
-        pub_at = video.get('published_at', '')
-        pub_str = f" &nbsp;•&nbsp; 📅 {pub_at[:10]}" if pub_at else ""
+        pub_at = video.get('published_at')
+        pub_str = f" &nbsp;•&nbsp; 📅 {pub_at[:10]}" if isinstance(pub_at, str) else ""
         
         # style 태그를 타이틀 마크다운과 묶어서 (독립된 여백 블록이 생기는 것을 방지)
         st.markdown(f"""
@@ -1217,8 +1288,8 @@ def render_video_card(video: dict, user_id: int):
         
     status = get_analysis_status(vid)
     
-    pub_at = video.get('published_at', '')
-    pub_str = f" &nbsp;•&nbsp; 📅 {pub_at[:10]}" if pub_at else ""
+    pub_at = video.get('published_at')
+    pub_str = f" &nbsp;•&nbsp; 📅 {pub_at[:10]}" if isinstance(pub_at, str) else ""
     
     st.image(video['thumbnail'], use_container_width=True)
     st.markdown(f'<div class="video-title">{title}</div>', unsafe_allow_html=True)
@@ -1387,17 +1458,10 @@ def main():
                 for insight in display_insights:
                     col1, col2 = st.columns([5, 1])
                     with col1:
-                        # 업로드 시각이 존재하면 표시, 아니면 저장 시각
-                        pub_at = insight['published_at']
-                        if pub_at:
-                            date_str = f"📅 {pub_at[:10]}"
-                        else:
-                            date_str = f"💾 {insight['created_at'][:10]}"
-                            
                         title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
-                        btn_label = f"{date_str} | {title}"
+                        btn_label = f"💾 {title}"
                         
-                        if st.button(btn_label[:35] + ("..." if len(btn_label) > 35 else ""), key=f"view_{insight['id']}", use_container_width=True):
+                        if st.button(btn_label[:30] + ("..." if len(btn_label) > 30 else ""), key=f"view_{insight['id']}", use_container_width=True):
                             st.session_state['selected_insight_id'] = insight['id']
                             st.rerun()
                     with col2:
@@ -1429,7 +1493,30 @@ def main():
     
     # 저장된 분석 보기 모드
     if 'selected_insight_id' in st.session_state:
-        insight = get_insight_by_id(st.session_state['selected_insight_id'])
+        selected_id = st.session_state['selected_insight_id']
+        # 좌측 메뉴에서 선택 시 메인 화면이 최상단으로 보이도록 스크롤 조작
+        # Streamlit은 HTML 문자열이 같으면 iframe을 새로고침하지 않으므로, id를 넣어 매번 다르게 인식시킵니다.
+        components.html(
+            f"""
+            <script>
+                var attempts = 0;
+                var myparent = window.parent;
+                var interval = setInterval(function() {{
+                    myparent.scrollTo(0, 0);
+                    var containers = myparent.document.querySelectorAll('.stAppViewContainer, .main, [data-testid="stAppViewMain"], [data-testid="stMain"]');
+                    containers.forEach(function(c) {{
+                        c.scrollTo(0, 0);
+                        c.scrollTop = 0;
+                    }});
+                    attempts += 1;
+                    if (attempts > 10) {{ clearInterval(interval); }}
+                }}, 50); // 실행 ID: {selected_id}
+            </script>
+            """,
+            height=0
+        )
+        
+        insight = get_insight_by_id(selected_id)
         
         if insight:
             title = insight['title'] if insight['title'] else "분석 결과"
@@ -1506,7 +1593,7 @@ def main():
     
     # 탭 구성: 로그인 상태에 따라 분기
     if is_logged_in:
-        tab1, tab2, tab3 = st.tabs(["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터"])
+        tab1, tab2, tab3, tab4 = st.tabs(["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터", "📰 내 신문"])
     else:
         tab1 = st.tabs(["🔗 URL 분석"])[0]
     
@@ -1554,20 +1641,21 @@ def main():
                     )
                 
                 with st.spinner("🤖 AI 분석 중..."):
-                    title, analysis_result = analyze_with_gemini(
+                    title, category, analysis_result = analyze_with_gemini(
                         transcript, 
                         st.session_state['api_key']
                     )
                 
                 # 로그인 상태에서만 DB에 저장
                 if is_logged_in and user_id:
-                    save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=None)
+                    save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=None, category=category)
                     st.success(f"✅ '{title}' 저장 완료!")
                 else:
                     st.info("💡 로그인하면 분석 결과가 자동 저장됩니다.")
                 
                 st.markdown("---")
                 st.subheader(f"📊 {title}")
+                st.caption(f"🏷️ 카테고리: {category}")
                 
                 # JSON이 raw로 반환된 경우 한 번 더 파싱 시도
                 display_result = analysis_result
@@ -1857,6 +1945,83 @@ def main():
                     st.info("📭 저장된 시세 데이터가 없습니다. 📥 버튼으로 데이터를 수집해주세요.")
         else:
             st.info("📭 종목을 먼저 추가해주세요.")
+            
+    if is_logged_in:
+        with tab4:
+            st.markdown("---")
+            st.header("📰 나만의 인터넷 신문 발행소")
+            st.markdown("저장된 분석(인사이트)들을 카테고리별로 모아 하나의 멋진 신문 기사를 만들어보세요.")
+            
+            # 발간 기간 지정
+            col_d1, col_d2, col_btn = st.columns([2, 2, 1])
+            with col_d1:
+                start_date = st.date_input("시작일", datetime.today() - timedelta(days=7))
+            with col_d2:
+                end_date = st.date_input("종료일", datetime.today())
+                
+            if start_date > end_date:
+                st.error("종료일이 시작일보다 빠를 수 없습니다.")
+                
+            with col_btn:
+                st.markdown("<br>", unsafe_allow_html=True)
+                publish_btn = st.button("🔥 신문 발행하기", use_container_width=True)
+                
+            if publish_btn:
+                # 1. 지정된 기간 내의 insights 조회
+                all_insights = get_all_insights(user_id=user_id)
+                target_insights = []
+                for ins in all_insights:
+                    if not ins['published_at']:
+                        continue
+                    pub_dt = datetime.fromisoformat(ins['published_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+                    # date 객체 타입 비교
+                    if start_date <= pub_dt.date() <= end_date:
+                        target_insights.append(ins)
+                
+                if not target_insights:
+                    st.warning("⚠️ 선택하신 기간 내에 분석된 유튜브 영상(새로운 데이터)이 없습니다.")
+                else:
+                    # 2. 카테고리별 분류
+                    categories = {'경제': [], 'IT': [], '문화': [], '그 외': []}
+                    for ins in target_insights:
+                        cat = ins['category'] if ins['category'] and ins['category'] in categories else '그 외'
+                        categories[cat].append(ins)
+                        
+                    with st.spinner("🤖 수석 편집장 Gemini가 신문을 조판하고 있습니다..."):
+                        final_newspaper = f"# 🗞️ Insight Magazine ({start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')})\n\n"
+                        api_key = st.session_state.get('api_key', '')
+                        
+                        # 각 카테고리별 병렬 생성은 API 리밋 우려가 있으므로 순차 처리
+                        for cat_name, ins_list in categories.items():
+                            if ins_list:
+                                compiled_text = ""
+                                for i, ins in enumerate(ins_list):
+                                    compiled_text += f"## [자료 {i+1}] {ins['title']}\n"
+                                    compiled_text += f"{ins['analysis_result']}\n\n"
+                                
+                                st.toast(f"📝 '{cat_name}' 섹션 기사 작성 중...", icon="✍️")
+                                section_article = generate_newspaper_section(cat_name, compiled_text, api_key)
+                                
+                                final_newspaper += f"---\n# 🏛️ [{cat_name} 섹션]\n\n{section_article}\n\n"
+                        
+                        # 3. 작성 완료 후 DB 저장
+                        title = f"Insight Magazine ({start_date.strftime('%Y.%m.%d')} - {end_date.strftime('%Y.%m.%d')})"
+                        target_period = f"{start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}"
+                        save_newspaper(user_id, title, target_period, final_newspaper)
+                        st.success("🎉 신문 발행이 파이프라인에서 성공적으로 전송되었습니다!")
+                        st.rerun()
+
+            st.markdown("---")
+            st.subheader("📚 보관중인 신문")
+            newspapers = get_all_newspapers(user_id=user_id)
+            
+            if newspapers:
+                for idx, news in enumerate(newspapers):
+                    with st.expander(f"📰 {news['title']} (발행일: {news['created_at'][:10]})", expanded=(idx==0)):
+                        st.caption(f"대상 기간: {news['target_period']}")
+                        st.markdown(news['content'])
+            else:
+                st.info("아직 발행된 신문이 없습니다.")
 
 
 if __name__ == "__main__":
