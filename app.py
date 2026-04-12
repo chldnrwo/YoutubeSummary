@@ -1505,6 +1505,30 @@ def main():
     # 사이드바 (로그인 성공 시에만 도달)
     # ============================================================
     with st.sidebar:
+        # 🎨 사이드바 스타일 커스텀 (글씨 크기 및 간격)
+        st.markdown("""
+            <style>
+                /* 사이드바 모든 버튼의 글자 크기 및 높이 조절 */
+                [data-testid="stSidebar"] .stButton button p {
+                    font-size: 13px !important;  /* ← 여기서 글씨 크기 조절 */
+                }
+                [data-testid="stSidebar"] .stButton button {
+                    height: 2.2rem !important;  /* 버튼 높이 조절 */
+                    padding: 0px 10px !important;
+                }
+                /* 사이드바 제목(Header) 크기 조절 */
+                [data-testid="stSidebar"] h2 {
+                    font-size: 1.1rem !important;
+                    font-weight: 700 !important;
+                    padding-bottom: 5px !important;
+                }
+                /* 프로필 텍스트 크기 */
+                [data-testid="stSidebar"] .stMarkdown p {
+                    font-size: 14px;
+                }
+            </style>
+        """, unsafe_allow_html=True)
+
         # 로그인 상태 프로필 표시
         col_profile, col_logout = st.columns([3, 1])
         with col_profile:
