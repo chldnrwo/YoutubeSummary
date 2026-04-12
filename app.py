@@ -156,6 +156,11 @@ def init_database():
         cursor.execute("ALTER TABLE insights ADD COLUMN published_at TIMESTAMP")
     except sqlite3.OperationalError:
         pass
+
+    try:
+        cursor.execute("ALTER TABLE insights ADD COLUMN category TEXT DEFAULT '그 외'")
+    except sqlite3.OperationalError:
+        pass
     
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_video_id ON insights(video_id)
