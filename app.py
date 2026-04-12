@@ -1396,29 +1396,76 @@ def main():
             user_id = user_info['user_id']
     
     # ============================================================
-    # 사이드바
+    # 🔒 보안 게이트: 구글 로그인 없으면 클로킹 페이지로 차단
+    # ============================================================
+    if not is_logged_in:
+        st.markdown("""
+        <style>
+            [data-testid="stSidebar"] { display: none !important; }
+            .block-container { max-width: 600px !important; margin: auto; }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style="text-align: center;">
+            <h1 style="font-size: 3.5rem; margin-bottom: 0;">🔍</h1>
+            <h1 style="margin-top: 0;">Insight Pipeline</h1>
+            <p style="color: #888; font-size: 1.1rem; margin-bottom: 2rem;">
+                YouTube 영상을 심층 분석하고, 나만의 인터넷 신문을 발행하세요.
+            </p>
+            <hr style="border: none; border-top: 1px solid #333; margin: 2rem 0;">
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # 구글 로그인 버튼
+        if CLIENT_SECRET_PATH.exists():
+            flow = get_oauth_flow()
+            if flow:
+                auth_url, _ = flow.authorization_url(prompt='consent')
+                st.markdown(f"""
+                <div style="text-align: center; margin-top: 1rem;">
+                    <a href="{auth_url}" target="_self" style="
+                        display: inline-block;
+                        padding: 14px 40px;
+                        background: linear-gradient(135deg, #4285F4, #34A853);
+                        color: white;
+                        text-decoration: none;
+                        border-radius: 8px;
+                        font-size: 1.1rem;
+                        font-weight: 600;
+                        box-shadow: 0 4px 15px rgba(66, 133, 244, 0.3);
+                        transition: transform 0.2s;
+                    ">🔐 Google 계정으로 로그인</a>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.error("⚠️ client_secret.json 파일이 없습니다. 관리자에게 문의하세요.")
+        
+        st.markdown("""
+        <div style="text-align: center; margin-top: 3rem; color: #666; font-size: 0.85rem;">
+            <p>이 서비스는 허가된 사용자만 이용할 수 있습니다.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.stop()  # 🚫 여기서 앱 완전 정지 — 아래 코드는 절대 실행되지 않음
+    
+    # ============================================================
+    # 사이드바 (로그인 성공 시에만 도달)
     # ============================================================
     with st.sidebar:
-        # 로그인 상태에 따른 프로필 표시
-        if is_logged_in and user_info:
-            col_profile, col_logout = st.columns([3, 1])
-            with col_profile:
-                st.markdown(f"👤 **{user_info['name']}**")
-            with col_logout:
-                if st.button("🚨", key="logout_btn", help="로그아웃"):
-                    if TOKEN_PATH.exists():
-                        TOKEN_PATH.unlink()
-                    # 세션 초기화
-                    for key in ['user_info', 'subscription_videos']:
-                        st.session_state.pop(key, None)
-                    st.rerun()
-        else:
-            st.info("🔐 로그인하면 구독 피드, 주식 데이터 등\n더 많은 기능을 사용할 수 있습니다.")
-            if CLIENT_SECRET_PATH.exists():
-                flow = get_oauth_flow()
-                if flow:
-                    auth_url, _ = flow.authorization_url(prompt='consent')
-                    st.markdown(f"[🔗 Google 계정으로 로그인]({auth_url})")
+        # 로그인 상태 프로필 표시
+        col_profile, col_logout = st.columns([3, 1])
+        with col_profile:
+            st.markdown(f"👤 **{user_info['name']}**")
+        with col_logout:
+            if st.button("🚨", key="logout_btn", help="로그아웃"):
+                if TOKEN_PATH.exists():
+                    TOKEN_PATH.unlink()
+                # 세션 초기화
+                for key in ['user_info', 'subscription_videos']:
+                    st.session_state.pop(key, None)
+                st.rerun()
         
         st.markdown("---")
         
