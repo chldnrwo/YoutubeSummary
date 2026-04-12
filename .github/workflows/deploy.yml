@@ -1,0 +1,26 @@
+name: CI/CD Pipeline for Streamlit
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to Oracle Cloud
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/YoutubeSummary
+            git pull origin main
+            source venv/bin/activate
+            # 필요한 패키지가 추가되었을 경우를 대비해 requirements 설치
+            pip install -r requirements.txt
+            # systemd 서비스 재시작으로 즉각 갱신
+            sudo systemctl restart insight-pipeline.service
