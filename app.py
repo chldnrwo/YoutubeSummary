@@ -1370,8 +1370,13 @@ def main():
     query_params = st.query_params
     if 'code' in query_params:
         # 현재 접속 프로토콜 및 호스트 기반으로 Redirect URI 결정
-        proto = st.context.headers.get("x-forwarded-proto", "http")
         host = st.context.headers.get("host", "localhost:8501")
+        # 도메인 접속 시에는 구글 보안 정책상 무조건 https를 사용해야 함
+        if "duckdns.org" in host:
+            proto = "https"
+        else:
+            proto = st.context.headers.get("x-forwarded-proto", "http")
+            
         redirect_uri = f"{proto}://{host}"
         
         flow = get_oauth_flow(redirect_uri=redirect_uri)
@@ -1435,8 +1440,12 @@ def main():
         # 구글 로그인 버튼
         if CLIENT_SECRET_PATH.exists():
             # 현재 접속 프로토콜 및 호스트 기반으로 Redirect URI 결정
-            proto = st.context.headers.get("x-forwarded-proto", "http")
             host = st.context.headers.get("host", "localhost:8501")
+            if "duckdns.org" in host:
+                proto = "https"
+            else:
+                proto = st.context.headers.get("x-forwarded-proto", "http")
+                
             redirect_uri = f"{proto}://{host}"
             
             flow = get_oauth_flow(redirect_uri=redirect_uri)
