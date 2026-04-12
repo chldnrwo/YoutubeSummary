@@ -206,20 +206,14 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_stock_date ON daily_prices(stock_id, date)
     """)
     
-    # 숨긴 영상 테이블
+    # OAuth 상태 저장 테이블 (세션 유실 방지용)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS hidden_videos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            video_id TEXT NOT NULL,
-            user_id INTEGER REFERENCES users(id),
-            hidden_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        CREATE TABLE IF NOT EXISTS oauth_states (
+            state TEXT PRIMARY KEY,
+            code_verifier TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
-    try:
-        cursor.execute("ALTER TABLE hidden_videos ADD COLUMN user_id INTEGER REFERENCES users(id)")
-    except sqlite3.OperationalError:
-        pass
     
     conn.commit()
     conn.close()
@@ -1371,7 +1365,6 @@ def main():
     if 'code' in query_params:
         # 현재 접속 프로토콜 및 호스트 기반으로 Redirect URI 결정
         host = st.context.headers.get("host", "localhost:8501")
-        # 도메인 접속 시에는 구글 보안 정책상 무조건 https를 사용해야 함
         if "duckdns.org" in host:
             proto = "https"
         else:
@@ -1382,12 +1375,27 @@ def main():
         flow = get_oauth_flow(redirect_uri=redirect_uri)
         if flow:
             try:
-                # 세션에 저장된 code_verifier 가져오기
+                # 1. DB에서 code_verifier 복구 (세션 유실 대비)
                 code_verifier = st.session_state.get('code_verifier')
+                state = query_params.get('state')
+                
+                if not code_verifier and state:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT code_verifier FROM oauth_states WHERE state = ?", (state,))
+                    row = cursor.fetchone()
+                    if row:
+                        code_verifier = row[0]
+                        # 사용한 토큰은 삭제
+                        cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+                        conn.commit()
+                    conn.close()
+                
                 flow.fetch_token(code=query_params['code'], code_verifier=code_verifier)
                 save_credentials(flow.credentials)
                 st.query_params.clear()
-                # 사용한 verifier 제거
+                
+                # 사용한 verifier 정리
                 if 'code_verifier' in st.session_state:
                     del st.session_state['code_verifier']
                 st.rerun()
@@ -1450,9 +1458,21 @@ def main():
             
             flow = get_oauth_flow(redirect_uri=redirect_uri)
             if flow:
-                auth_url, _ = flow.authorization_url(prompt='consent')
-                # PKCE 검증을 위한 code_verifier 세션 저장 (중요!)
+                auth_url, state = flow.authorization_url(prompt='consent')
+                
+                # PKCE 검증을 위한 code_verifier 저장 (세션 + DB 이중 백업)
                 st.session_state['code_verifier'] = flow.code_verifier
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    # 1시간 이상 된 오래된 상태값 정리
+                    cursor.execute("DELETE FROM oauth_states WHERE created_at < datetime('now', '-1 hour')")
+                    cursor.execute("INSERT INTO oauth_states (state, code_verifier) VALUES (?, ?)", 
+                                 (state, flow.code_verifier))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"[ERROR] OAuth 상태 저장 실패: {e}")
                 
                 st.markdown(f"""
                 <div style="text-align: center; margin-top: 1rem;">
