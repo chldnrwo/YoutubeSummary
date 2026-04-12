@@ -1,6 +1,7 @@
 # OAuth 시크릿 (절대 커밋 금지!)
 client_secret*.json
 token*.json
+config.json
 
 # 데이터베이스
 *.db
