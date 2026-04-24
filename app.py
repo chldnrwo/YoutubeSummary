@@ -219,29 +219,6 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # 숨김 영상 테이블
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS hidden_videos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            video_id TEXT NOT NULL,
-            user_id INTEGER REFERENCES users(id),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(video_id, user_id)
-        )
-    """)
-
-    # 생성된 신문 저장 테이블
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS newspapers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER REFERENCES users(id),
-            title TEXT,
-            target_period TEXT,
-            content TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
     
     conn.commit()
     conn.close()
@@ -1136,12 +1113,16 @@ def get_transcript(video_id: str) -> str:
             raise Exception(f"자막 추출 중 오류 발생: {error_msg}")
 
 
-def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str]:
+def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str, str]:
     """Gemini를 사용하여 자막 텍스트를 분석합니다."""
     genai.configure(api_key=api_key)
     
+    # 자막 길이에 따라 비용 효율적인 모델 선택 (30,000자 기준)
+    target_model_name = "gemini-2.5-flash-lite" if len(transcript) <= 30000 else "gemini-2.5-flash"
+    print(f"[DEBUG] 자막 길이: {len(transcript)}자 -> 사용 모델: {target_model_name}")
+    
     model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
+        model_name=target_model_name,
         generation_config=genai.GenerationConfig(
             temperature=0,
             top_p=0.95,
@@ -1633,7 +1614,7 @@ def main():
                 st.caption("저장된 분석이 없습니다.")
         
         st.markdown("---")
-        st.caption("Powered by Google Gemini 2.0 Flash")
+        st.caption("Powered by Google Gemini 2.5 Flash")
     
     # ============================================================
     # 메인 화면
