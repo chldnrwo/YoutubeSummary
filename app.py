@@ -12,8 +12,10 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timedelta
 from pathlib import Path
+import uuid
 import streamlit as st
 import streamlit.components.v1 as components
+import extra_streamlit_components as stx
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import WebshareProxyConfig
@@ -34,6 +36,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+@st.cache_resource
+def get_cookie_manager():
+    return stx.CookieManager()
+
+cookie_manager = get_cookie_manager()
 
 # ============================================================
 # 커스텀 CSS
@@ -216,6 +224,15 @@ def init_database():
         CREATE TABLE IF NOT EXISTS oauth_states (
             state TEXT PRIMARY KEY,
             code_verifier TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # 영구 로그인용 세션 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            credentials_json TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -773,33 +790,48 @@ def get_oauth_flow(redirect_uri=None):
 
 
 def get_youtube_client():
-    """인증된 YouTube API 클라이언트를 반환합니다."""
-    if not TOKEN_PATH.exists():
+    """인증된 YouTube API 클라이언트를 반환합니다. (세션 및 쿠키 기반)"""
+    creds_json = st.session_state.get('user_credentials')
+    
+    # 1. 세션에 없으면 브라우저 쿠키에서 session_id를 읽어 DB에서 복원 시도
+    if not creds_json:
+        session_id = cookie_manager.get('login_session_id')
+        if session_id:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT credentials_json FROM sessions WHERE session_id = ?", (session_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                creds_json = row[0]
+                st.session_state['user_credentials'] = creds_json
+            else:
+                # DB에 없는 유효하지 않은 쿠키인 경우 삭제
+                cookie_manager.delete('login_session_id')
+                
+    if not creds_json:
         return None
     
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        import json
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
         
         # 토큰이 만료되었지만 refresh_token이 있으면 자동 갱신
         if creds and not creds.valid and creds.expired and creds.refresh_token:
             from google.auth.transport.requests import Request
             creds.refresh(Request())
-            save_credentials(creds)
+            # 갱신된 토큰을 세션에 다시 저장
+            st.session_state['user_credentials'] = creds.to_json()
         
         if creds and creds.valid:
             return build('youtube', 'v3', credentials=creds)
     except Exception:
-        # 갱신 실패 시 (refresh_token 만료 등) 토큰 파일 삭제 → 재로그인 유도
-        if TOKEN_PATH.exists():
-            TOKEN_PATH.unlink()
+        # 갱신 실패 시 세션에서 삭제 -> 재로그인 유도
+        if 'user_credentials' in st.session_state:
+            del st.session_state['user_credentials']
     
     return None
-
-
-def save_credentials(creds):
-    """인증 정보를 파일에 저장합니다."""
-    with open(TOKEN_PATH, 'w') as f:
-        f.write(creds.to_json())
 
 
 def get_subscriptions(youtube):
@@ -1414,7 +1446,22 @@ def main():
                     conn.close()
                 
                 flow.fetch_token(code=query_params['code'], code_verifier=code_verifier)
-                save_credentials(flow.credentials)
+                creds_json = flow.credentials.to_json()
+                
+                # 세션 ID 생성 및 DB 저장
+                new_session_id = str(uuid.uuid4())
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO sessions (session_id, credentials_json) VALUES (?, ?)", (new_session_id, creds_json))
+                conn.commit()
+                conn.close()
+                
+                # 쿠키에 session_id 설정 (유효기간 30일)
+                expires_at = datetime.now() + timedelta(days=30)
+                cookie_manager.set('login_session_id', new_session_id, expires_at=expires_at)
+                
+                # 세션에 JSON 문자열 저장
+                st.session_state['user_credentials'] = creds_json
                 st.query_params.clear()
                 
                 # 사용한 verifier 정리
@@ -1557,10 +1604,18 @@ def main():
             st.markdown(f"👤 **{user_info['name']}**")
         with col_logout:
             if st.button("🚨", key="logout_btn", help="로그아웃"):
-                if TOKEN_PATH.exists():
-                    TOKEN_PATH.unlink()
+                # 쿠키와 연동된 DB 세션 삭제
+                session_id = cookie_manager.get('login_session_id')
+                if session_id:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+                    conn.commit()
+                    conn.close()
+                    cookie_manager.delete('login_session_id')
+                
                 # 세션 초기화
-                for key in ['user_info', 'subscription_videos']:
+                for key in ['user_credentials', 'user_info', 'subscription_videos']:
                     st.session_state.pop(key, None)
                 st.rerun()
         
