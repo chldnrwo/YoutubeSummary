@@ -36,12 +36,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-@st.cache_resource
-def get_cookie_manager():
-    return stx.CookieManager()
-
-cookie_manager = get_cookie_manager()
+# 쿠키 매니저 초기화 (최신 Streamlit에서는 캐시 내에 위젯 생성을 경고하므로 key를 고정하여 직접 호출)
+cookie_manager = stx.CookieManager(key="global_cookie_manager")
 
 # ============================================================
 # 커스텀 CSS
@@ -826,7 +822,9 @@ def get_youtube_client():
         
         if creds and creds.valid:
             return build('youtube', 'v3', credentials=creds)
-    except Exception:
+    except Exception as e:
+        # 에러 디버깅을 위해 에러 메시지 표시
+        st.error(f"YouTube Client Error: {str(e)}")
         # 갱신 실패 시 세션에서 삭제 -> 재로그인 유도
         if 'user_credentials' in st.session_state:
             del st.session_state['user_credentials']
@@ -1417,59 +1415,66 @@ def main():
     # URL 파라미터에서 OAuth 콜백 처리
     query_params = st.query_params
     if 'code' in query_params:
-        # 현재 접속 프로토콜 및 호스트 기반으로 Redirect URI 결정
-        host = st.context.headers.get("host", "localhost:8501")
-        if "duckdns.org" in host:
-            proto = "https"
-        else:
-            proto = st.context.headers.get("x-forwarded-proto", "http")
-            
-        redirect_uri = f"{proto}://{host}"
+        current_code = query_params['code']
         
-        flow = get_oauth_flow(redirect_uri=redirect_uri)
-        if flow:
-            try:
-                # 1. DB에서 code_verifier 복구 (세션 유실 대비)
-                code_verifier = st.session_state.get('code_verifier')
-                state = query_params.get('state')
+        # 이미 처리 중인/완료된 코드라면 중복 실행 방지
+        if st.session_state.get('processed_oauth_code') != current_code:
+            # 현재 접속 프로토콜 및 호스트 기반으로 Redirect URI 결정
+            host = st.context.headers.get("host", "localhost:8501")
+            if "duckdns.org" in host:
+                proto = "https"
+            else:
+                proto = st.context.headers.get("x-forwarded-proto", "http")
                 
-                if not code_verifier and state:
+            redirect_uri = f"{proto}://{host}"
+            
+            flow = get_oauth_flow(redirect_uri=redirect_uri)
+            if flow:
+                try:
+                    # 1. DB에서 code_verifier 복구 (세션 유실 대비)
+                    code_verifier = st.session_state.get('code_verifier')
+                    state = query_params.get('state')
+                    
+                    if not code_verifier and state:
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT code_verifier FROM oauth_states WHERE state = ?", (state,))
+                        row = cursor.fetchone()
+                        if row:
+                            code_verifier = row[0]
+                            # 사용한 토큰은 삭제
+                            cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+                            conn.commit()
+                        conn.close()
+                    
+                    flow.fetch_token(code=query_params['code'], code_verifier=code_verifier)
+                    creds_json = flow.credentials.to_json()
+                    
+                    # 세션 ID 생성 및 DB 저장
+                    new_session_id = str(uuid.uuid4())
                     conn = sqlite3.connect(DB_PATH)
                     cursor = conn.cursor()
-                    cursor.execute("SELECT code_verifier FROM oauth_states WHERE state = ?", (state,))
-                    row = cursor.fetchone()
-                    if row:
-                        code_verifier = row[0]
-                        # 사용한 토큰은 삭제
-                        cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
-                        conn.commit()
+                    cursor.execute("INSERT INTO sessions (session_id, credentials_json) VALUES (?, ?)", (new_session_id, creds_json))
+                    conn.commit()
                     conn.close()
-                
-                flow.fetch_token(code=query_params['code'], code_verifier=code_verifier)
-                creds_json = flow.credentials.to_json()
-                
-                # 세션 ID 생성 및 DB 저장
-                new_session_id = str(uuid.uuid4())
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO sessions (session_id, credentials_json) VALUES (?, ?)", (new_session_id, creds_json))
-                conn.commit()
-                conn.close()
-                
-                # 쿠키에 session_id 설정 (유효기간 30일)
-                expires_at = datetime.now() + timedelta(days=30)
-                cookie_manager.set('login_session_id', new_session_id, expires_at=expires_at)
-                
-                # 세션에 JSON 문자열 저장
-                st.session_state['user_credentials'] = creds_json
-                st.query_params.clear()
-                
-                # 사용한 verifier 정리
-                if 'code_verifier' in st.session_state:
-                    del st.session_state['code_verifier']
-                st.rerun()
-            except Exception as e:
-                st.error(f"인증 오류: {str(e)}")
+                    
+                    # 쿠키에 session_id 설정 (유효기간 30일)
+                    expires_at = datetime.now() + timedelta(days=30)
+                    cookie_manager.set('login_session_id', new_session_id, expires_at=expires_at)
+                    
+                    # 세션에 JSON 문자열 저장
+                    st.session_state['user_credentials'] = creds_json
+                    st.query_params.clear()
+                    
+                    # 사용한 verifier 정리
+                    if 'code_verifier' in st.session_state:
+                        del st.session_state['code_verifier']
+                    
+                    # 여기까지 성공했다면 플래그 세팅
+                    st.session_state['processed_oauth_code'] = current_code
+                    # st.rerun() 주석 처리: 쿠키 컴포넌트가 클라이언트에 전달되려면 현재 렌더 사이클을 완주해야 함
+                except Exception as e:
+                    st.error(f"인증 오류: {str(e)}")
     
     # ============================================================
     # 로그인 상태 확인 + 사용자 정보 로드
