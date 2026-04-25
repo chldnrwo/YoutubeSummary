@@ -5,6 +5,11 @@ YouTube 영상의 자막을 추출하고 Google Gemini AI를 활용하여 지식
 
 import re
 import json
+import sys
+
+def _dbg(msg):
+    sys.stderr.write(f"{msg}\n")
+    sys.stderr.flush()
 import sqlite3
 import os
 import threading
@@ -788,10 +793,15 @@ def get_oauth_flow(redirect_uri=None):
 def get_youtube_client():
     """인증된 YouTube API 클라이언트를 반환합니다. (세션 및 쿠키 기반)"""
     creds_json = st.session_state.get('user_credentials')
+    _dbg(f"[YT_CLIENT] 1. session creds_json exists: {bool(creds_json)}")
     
     # 1. 세션에 없으면 브라우저 쿠키에서 session_id를 읽어 DB에서 복원 시도
     if not creds_json:
-        session_id = cookie_manager.get('login_session_id')
+        # pending_session_id (방금 로그인 완료, 쿠키 미반영 상태) 또는 쿠키에서 읽기
+        pending_sid = st.session_state.get('pending_session_id')
+        cookie_sid = cookie_manager.get('login_session_id')
+        session_id = pending_sid or cookie_sid
+        _dbg(f"[YT_CLIENT] 2. pending_sid={pending_sid}, cookie_sid={cookie_sid}, using={session_id}")
         if session_id:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
@@ -801,17 +811,21 @@ def get_youtube_client():
             if row:
                 creds_json = row[0]
                 st.session_state['user_credentials'] = creds_json
+                _dbg(f"[YT_CLIENT] 3. DB에서 credentials 복원 성공")
             else:
                 # DB에 없는 유효하지 않은 쿠키인 경우 삭제
                 cookie_manager.delete('login_session_id')
+                _dbg(f"[YT_CLIENT] 3. DB에 session_id 없음, 쿠키 삭제")
                 
     if not creds_json:
+        _dbg(f"[YT_CLIENT] 4. creds_json 없음 → None 반환")
         return None
     
     try:
         import json
         creds_dict = json.loads(creds_json)
         creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
+        _dbg(f"[YT_CLIENT] 5. creds.valid={creds.valid}, creds.expired={creds.expired}, has_refresh={bool(creds.refresh_token)}")
         
         # 토큰이 만료되었지만 refresh_token이 있으면 자동 갱신
         if creds and not creds.valid and creds.expired and creds.refresh_token:
@@ -819,11 +833,16 @@ def get_youtube_client():
             creds.refresh(Request())
             # 갱신된 토큰을 세션에 다시 저장
             st.session_state['user_credentials'] = creds.to_json()
+            _dbg(f"[YT_CLIENT] 6. 토큰 갱신 성공")
         
         if creds and creds.valid:
+            _dbg(f"[YT_CLIENT] 7. YouTube 클라이언트 빌드 성공!")
             return build('youtube', 'v3', credentials=creds)
+        else:
+            _dbg(f"[YT_CLIENT] 7. creds not valid → None 반환")
     except Exception as e:
         # 에러 디버깅을 위해 에러 메시지 표시
+        _dbg(f"[YT_CLIENT] ERROR: {str(e)}")
         st.error(f"YouTube Client Error: {str(e)}")
         # 갱신 실패 시 세션에서 삭제 -> 재로그인 유도
         if 'user_credentials' in st.session_state:
@@ -1413,71 +1432,101 @@ def main():
         st.session_state['api_key'] = default_api_key
     
     # URL 파라미터에서 OAuth 콜백 처리
+    # URL 파라미터에서 OAuth 콜백 처리
     query_params = st.query_params
-    if 'code' in query_params:
+    has_code = 'code' in query_params
+    has_creds = 'user_credentials' in st.session_state
+    _dbg(f"[OAUTH] query has 'code': {has_code}, session has 'user_credentials': {has_creds}, all keys: {list(query_params.keys())}")
+    
+    if has_code and not has_creds:
         current_code = query_params['code']
+        state = query_params.get('state')
         
-        # 이미 처리 중인/완료된 코드라면 중복 실행 방지
-        if st.session_state.get('processed_oauth_code') != current_code:
-            # 현재 접속 프로토콜 및 호스트 기반으로 Redirect URI 결정
-            host = st.context.headers.get("host", "localhost:8501")
-            if "duckdns.org" in host:
-                proto = "https"
-            else:
-                proto = st.context.headers.get("x-forwarded-proto", "http")
-                
-            redirect_uri = f"{proto}://{host}"
+        if state:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
             
-            flow = get_oauth_flow(redirect_uri=redirect_uri)
-            if flow:
-                try:
-                    # 1. DB에서 code_verifier 복구 (세션 유실 대비)
-                    code_verifier = st.session_state.get('code_verifier')
-                    state = query_params.get('state')
+            creds_json = None
+            import time
+            
+            # 스핀락(Spinlock) 대기: 다른 스레드가 처리 중인지 확인
+            for _ in range(20):  # 최대 10초 대기 (0.5 * 20)
+                cursor.execute("SELECT code_verifier, credentials_json FROM oauth_states WHERE state = ?", (state,))
+                row = cursor.fetchone()
+                
+                if not row:
+                    _dbg("[OAUTH] DB에 state가 존재하지 않음 (이미 처리됨).")
+                    st.query_params.clear()
+                    break
                     
-                    if not code_verifier and state:
-                        conn = sqlite3.connect(DB_PATH)
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT code_verifier FROM oauth_states WHERE state = ?", (state,))
-                        row = cursor.fetchone()
-                        if row:
-                            code_verifier = row[0]
-                            # 사용한 토큰은 삭제
+                code_verifier, saved_creds_json = row
+                if code_verifier == 'None':
+                    code_verifier = None
+                    
+                if saved_creds_json == 'PROCESSING':
+                    _dbg("[OAUTH] 다른 스레드가 토큰 교환 중. 대기...")
+                    time.sleep(0.5)
+                    continue
+                    
+                if saved_creds_json:
+                    # 다른 스레드(이전 실행)에서 이미 토큰 교환을 완료한 경우
+                    _dbg("[OAUTH] 다른 스레드에서 이미 토큰 교환 완료. DB에서 가져옴.")
+                    creds_json = saved_creds_json
+                    break
+                else:
+                    # 내가 토큰 교환을 해야 하는 경우
+                    _dbg("[OAUTH] 토큰 교환 권한 획득 (PROCESSING 마킹)")
+                    cursor.execute("UPDATE oauth_states SET credentials_json = 'PROCESSING' WHERE state = ?", (state,))
+                    conn.commit()
+                    
+                    # 현재 접속 프로토콜 및 호스트 기반으로 Redirect URI 결정
+                    host = st.context.headers.get("host", "localhost:8501")
+                    if "duckdns.org" in host:
+                        proto = "https"
+                    else:
+                        proto = st.context.headers.get("x-forwarded-proto", "http")
+                        
+                    redirect_uri = f"{proto}://{host}"
+                    flow = get_oauth_flow(redirect_uri=redirect_uri)
+                    
+                    if flow:
+                        try:
+                            flow.fetch_token(code=current_code, code_verifier=code_verifier)
+                            creds_json = flow.credentials.to_json()
+                            
+                            # 만약 내가 중간에 끊기더라도 다음 스레드가 쓸 수 있게 DB에 완료 저장
+                            cursor.execute("UPDATE oauth_states SET credentials_json = ? WHERE state = ?", (creds_json, state))
+                            conn.commit()
+                            _dbg("[OAUTH] 토큰 교환 성공 및 DB 저장 완료.")
+                        except Exception as e:
+                            _dbg(f"[DEBUG] 인증 예외 발생: {e}")
+                            st.query_params.clear()
+                            # 에러 시 레코드 삭제
                             cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
                             conn.commit()
-                        conn.close()
+                    break
                     
-                    flow.fetch_token(code=query_params['code'], code_verifier=code_verifier)
-                    creds_json = flow.credentials.to_json()
-                    
-                    # 세션 ID 생성 및 DB 저장
-                    new_session_id = str(uuid.uuid4())
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute("INSERT INTO sessions (session_id, credentials_json) VALUES (?, ?)", (new_session_id, creds_json))
-                    conn.commit()
-                    conn.close()
-                    
-                    # 쿠키에 session_id 설정 (유효기간 30일)
-                    expires_at = datetime.now() + timedelta(days=30)
-                    cookie_manager.set('login_session_id', new_session_id, expires_at=expires_at)
-                    
-                    # 세션에 JSON 문자열 저장
-                    st.session_state['user_credentials'] = creds_json
-                    st.query_params.clear()
-                    
-                    # 사용한 verifier 정리
-                    if 'code_verifier' in st.session_state:
-                        del st.session_state['code_verifier']
-                    
-                    # 여기까지 성공했다면 플래그 세팅
-                    st.session_state['processed_oauth_code'] = current_code
-                    # st.rerun() 주석 처리: 쿠키 컴포넌트가 클라이언트에 전달되려면 현재 렌더 사이클을 완주해야 함
-                except Exception as e:
-                    st.error(f"인증 오류: {str(e)}")
-    
-    # ============================================================
-    # 로그인 상태 확인 + 사용자 정보 로드
+            if creds_json:
+                # 세션 ID 생성 및 DB 저장
+                new_session_id = str(uuid.uuid4())
+                cursor.execute("INSERT INTO sessions (session_id, credentials_json) VALUES (?, ?)", (new_session_id, creds_json))
+                conn.commit()
+                
+                # 사용한 state 정리는 생략 (다른 스레드가 읽을 수 있도록 유지, DB 용량 이슈는 거의 없음)
+                
+                # 세션에 저장 (query_params를 건드리지 않으므로 세션 유지됨)
+                st.session_state['user_credentials'] = creds_json
+                st.session_state['pending_session_id'] = new_session_id
+                
+                if 'code_verifier' in st.session_state:
+                    del st.session_state['code_verifier']
+                
+                _dbg(f"[DEBUG] 최종 인증 처리 완료! session_id={new_session_id}")
+                
+            conn.close()
+    elif has_code and has_creds:
+        # 이미 로그인된 상태에서 OAuth 파라미터가 남아있으면 정리
+        st.query_params.clear()
     # ============================================================
     youtube = get_youtube_client()
     is_logged_in = youtube is not None
@@ -1485,6 +1534,20 @@ def main():
     user_id = None
     
     if is_logged_in:
+        # 방금 로그인 완료된 경우 쿠키에 세션ID 저장 (영구 로그인)
+        pending_sid = st.session_state.pop('pending_session_id', None)
+        if pending_sid:
+            expires_at = datetime.now() + timedelta(days=30)
+            cookie_manager.set('login_session_id', pending_sid, expires_at=expires_at)
+        
+        # URL에 OAuth 파라미터가 남아있으면 JS로 정리 (세션 리셋 방지)
+        if 'code' in query_params:
+            components.html("""
+                <script>
+                    window.parent.history.replaceState({}, '', window.parent.location.pathname);
+                </script>
+            """, height=0)
+        
         # 세션에 캐싱된 사용자 정보 사용 (API 쿠타 절약)
         if 'user_info' not in st.session_state:
             user_info = get_current_user_info(youtube)
@@ -1541,8 +1604,11 @@ def main():
                     cursor = conn.cursor()
                     # 1시간 이상 된 오래된 상태값 정리
                     cursor.execute("DELETE FROM oauth_states WHERE created_at < datetime('now', '-1 hour')")
+                    
+                    # flow.code_verifier가 None일 경우 'None' 문자열로 저장하여 DB NOT NULL 제약조건 통과
+                    cv_to_save = flow.code_verifier if flow.code_verifier else 'None'
                     cursor.execute("INSERT INTO oauth_states (state, code_verifier) VALUES (?, ?)", 
-                                 (state, flow.code_verifier))
+                                 (state, cv_to_save))
                     conn.commit()
                     conn.close()
                 except Exception as e:
@@ -2269,5 +2335,15 @@ def main():
                 st.info("아직 발행된 신문이 없습니다.")
 
 
+import sys
+def _dbg(msg):
+    sys.stderr.write(f"{msg}\n")
+    sys.stderr.flush()
+
+_dbg(f"[BOOT] __name__ = {__name__}")
 if __name__ == "__main__":
+    _dbg("[BOOT] main() 호출됨 via __main__")
+    main()
+else:
+    _dbg("[BOOT] __name__ != __main__, main() 직접 호출")
     main()
