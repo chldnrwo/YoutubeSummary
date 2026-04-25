@@ -1159,33 +1159,46 @@ def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str, str]:
         if not json_str and response_text.startswith('{'):
             json_str = response_text
         
-        # 4. 중괄호가 어딘가에 있으면 추출 시도
+        # 4. 중괄호가 어딘가에 있으면 추출 시도 (도중에 잘렸을 수 있으므로 끝까지)
         if not json_str:
-            brace_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            brace_match = re.search(r'\{.*', response_text, re.DOTALL)
             if brace_match:
                 json_str = brace_match.group(0)
         
         if json_str:
-            result = json.loads(json_str, strict=False)
-            title = result.get('title', '제목 없음')
-            category = result.get('category', '그 외')
-            analysis = result.get('analysis', response_text)
-            print(f"[DEBUG] Parsed title: {title}, category: {category}")
-            return title, category, analysis
+            fixed_json_str = json_str.strip()
+            if fixed_json_str.endswith('```'):
+                fixed_json_str = fixed_json_str[:-3].strip()
+            
+            if not fixed_json_str.endswith('}'):
+                if fixed_json_str.count('"') % 2 != 0:
+                    fixed_json_str += '"'
+                fixed_json_str += '\n}'
+                
+            try:
+                result = json.loads(fixed_json_str, strict=False)
+                title = result.get('title', '제목 없음')
+                category = result.get('category', '그 외')
+                analysis = result.get('analysis', response_text)
+                print(f"[DEBUG] Parsed title: {title}, category: {category}")
+                return title, category, analysis
+            except Exception as e:
+                print(f"[DEBUG] Fixed JSON parsing failed: {e}")
+                title_match = re.search(r'"title"\s*:\s*"([^"]+)"', fixed_json_str)
+                cat_match = re.search(r'"category"\s*:\s*"([^"]+)"', fixed_json_str)
+                title = title_match.group(1) if title_match else "분석 완료"
+                category = cat_match.group(1) if cat_match else "그 외"
+                return title, category, response_text
         else:
             return "분석 완료", "그 외", response_text
             
     except Exception as e:
         print(f"[DEBUG] JSON parsing error: {e}")
-        # 마지막 시도: 중괄호 찾아서 파싱
-        try:
-            brace_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-            if brace_match:
-                result = json.loads(brace_match.group(0), strict=False)
-                return result.get('title', '제목 없음'), result.get('category', '그 외'), result.get('analysis', response.text)
-        except:
-            pass
-        return "분석 완료", "그 외", response.text
+        title_match = re.search(r'"title"\s*:\s*"([^"]+)"', response.text)
+        cat_match = re.search(r'"category"\s*:\s*"([^"]+)"', response.text)
+        title = title_match.group(1) if title_match else "분석 완료"
+        category = cat_match.group(1) if cat_match else "그 외"
+        return title, category, response.text
 
 
 def generate_newspaper_section(category: str, insights_text: str, api_key: str) -> str:
@@ -1582,34 +1595,53 @@ def main():
             insights = get_all_insights(user_id=user_id)
             
             if insights:
-                SHOW_COUNT = 10
-                show_all = st.session_state.get('show_all_insights', False)
-                display_insights = insights if show_all else insights[:SHOW_COUNT]
+                today_insights = []
+                week_insights = []
+                past_insights = []
                 
-                for insight in display_insights:
-                    col1, col2 = st.columns([5, 1])
-                    with col1:
-                        title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
-                        btn_label = f"💾 {title}"
+                now = datetime.utcnow()
+                
+                for insight in insights:
+                    created_at_str = insight['created_at']
+                    try:
+                        created_dt = datetime.strptime(created_at_str[:19], '%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        created_dt = now
                         
-                        if st.button(btn_label[:30] + ("..." if len(btn_label) > 30 else ""), key=f"view_{insight['id']}", use_container_width=True):
-                            st.session_state['selected_insight_id'] = insight['id']
-                            st.rerun()
-                    with col2:
-                        if st.button("🗑️", key=f"del_{insight['id']}"):
-                            delete_insight(insight['id'])
-                            st.rerun()
-                
-                if len(insights) > SHOW_COUNT:
-                    if show_all:
-                        if st.button("📁 접기", key="collapse_insights", use_container_width=True):
-                            st.session_state['show_all_insights'] = False
-                            st.rerun()
+                    diff = now - created_dt
+                    
+                    if diff.total_seconds() <= 24 * 3600:
+                        today_insights.append(insight)
+                    elif diff.total_seconds() <= 168 * 3600:
+                        week_insights.append(insight)
                     else:
-                        remaining = len(insights) - SHOW_COUNT
-                        if st.button(f"📂 더보기 (+{remaining}개)", key="expand_insights", use_container_width=True):
-                            st.session_state['show_all_insights'] = True
-                            st.rerun()
+                        past_insights.append(insight)
+                        
+                def render_insight_list(insight_list, prefix=""):
+                    for insight in insight_list:
+                        col1, col2 = st.columns([5, 1])
+                        with col1:
+                            title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
+                            btn_label = f"💾 {title}"
+                            if st.button(btn_label[:30] + ("..." if len(btn_label) > 30 else ""), key=f"{prefix}view_{insight['id']}", use_container_width=True):
+                                st.session_state['selected_insight_id'] = insight['id']
+                                st.rerun()
+                        with col2:
+                            if st.button("🗑️", key=f"{prefix}del_{insight['id']}"):
+                                delete_insight(insight['id'])
+                                st.rerun()
+
+                if today_insights:
+                    st.markdown("**🔹 오늘 분석**")
+                    render_insight_list(today_insights, prefix="today_")
+                    
+                if week_insights:
+                    with st.expander(f"**🔸 금주 분석** ({len(week_insights)})"):
+                        render_insight_list(week_insights, prefix="week_")
+                        
+                if past_insights:
+                    with st.expander(f"**📂 과거 분석** ({len(past_insights)})"):
+                        render_insight_list(past_insights, prefix="past_")
             else:
                 st.caption("저장된 분석이 없습니다.")
         
@@ -1655,11 +1687,24 @@ def main():
             
             # 저장된 analysis_result가 raw JSON이면 파싱하여 표시
             raw = display_analysis.strip()
+            
+            # 0. 앞뒤 마크다운 코드블록(```json) 제거
+            if raw.startswith('```'):
+                raw = re.sub(r'^```(json)?\s*', '', raw)
+            if raw.endswith('```'):
+                raw = re.sub(r'\s*```$', '', raw)
+                
             if raw.startswith('{'):
                 parsed_ok = False
-                # 1차: json.loads 시도
+                # 1차: json.loads 시도 (잘린 JSON 복구 포함)
                 try:
-                    parsed = json.loads(raw, strict=False)
+                    fixed_raw = raw
+                    if not fixed_raw.endswith('}'):
+                        if fixed_raw.count('"') % 2 != 0:
+                            fixed_raw += '"'
+                        fixed_raw += '\n}'
+                        
+                    parsed = json.loads(fixed_raw, strict=False)
                     if isinstance(parsed, dict):
                         if 'analysis' in parsed:
                             display_analysis = parsed['analysis']
@@ -1671,10 +1716,19 @@ def main():
                 
                 # 2차: json.loads 실패 시 정규식으로 추출
                 if not parsed_ok:
-                    # "analysis": "..." 패턴에서 값 추출
-                    analysis_match = re.search(r'"analysis"\s*:\s*"(.*)"', raw, re.DOTALL)
+                    # "analysis": "..." 뒷부분 전체를 추출 (잘려서 닫는 따옴표가 없을 수 있음)
+                    analysis_match = re.search(r'"analysis"\s*:\s*"(.*)', raw, re.DOTALL)
                     if analysis_match:
-                        display_analysis = analysis_match.group(1)
+                        display_analysis = analysis_match.group(1).strip()
+                        
+                        # 단계별로 끝부분 쓰레기 문자 제거
+                        if display_analysis.endswith('```'):
+                            display_analysis = display_analysis[:-3].strip()
+                        if display_analysis.endswith('}'):
+                            display_analysis = display_analysis[:-1].strip()
+                        if display_analysis.endswith('"'):
+                            display_analysis = display_analysis[:-1].strip()
+                            
                         # JSON 이스케이프 해제
                         display_analysis = display_analysis.replace('\\"', '"')
                     
