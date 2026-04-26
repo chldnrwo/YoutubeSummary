@@ -1784,7 +1784,14 @@ def main():
                             title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
                             viewed = st.session_state.get('viewed_insights', set())
                             is_viewed = insight['id'] in viewed
-                            icon = "✅" if is_viewed else "💾"
+                            is_current = st.session_state.get('selected_insight_id') == insight['id']
+                            
+                            if is_current:
+                                icon = "👉"
+                            elif is_viewed:
+                                icon = "✅"
+                            else:
+                                icon = "💾"
                             btn_label = f"{icon} {title}"
                             if st.button(btn_label[:30] + ("..." if len(btn_label) > 30 else ""), key=f"{prefix}view_{insight['id']}", use_container_width=True):
                                 st.session_state['selected_insight_id'] = insight['id']
