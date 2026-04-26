@@ -2036,7 +2036,7 @@ def main():
             selected_label = st.selectbox(
                 "📅 조회 기간",
                 options=list(days_map.keys()),
-                index=3,
+                index=1,
                 key="days_selector"
             )
             selected_days = days_map[selected_label]
