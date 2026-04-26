@@ -6,3 +6,4 @@ google-auth-oauthlib>=1.1.0
 requests>=2.31.0
 apscheduler>=3.10.0
 extra-streamlit-components>=0.1.71
+chromadb>=0.4.24

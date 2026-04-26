@@ -22,6 +22,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import extra_streamlit_components as stx
 import google.generativeai as genai
+import chromadb
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import WebshareProxyConfig
 
@@ -311,9 +312,41 @@ def save_insight(video_id: str, video_url: str, title: str, transcript: str, ana
         INSERT INTO insights (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category))
+    db_id = cursor.lastrowid
     
     conn.commit()
     conn.close()
+    
+    # ----------------------------------------------------
+    # RAG (ChromaDB) 자동 연동
+    # ----------------------------------------------------
+    try:
+        chroma_client = chromadb.PersistentClient(path='chroma_db')
+        collection = chroma_client.get_or_create_collection(name="insights_collection")
+        
+        text_to_embed = f"Title: {title}\n\nAnalysis:\n{analysis_result}"
+        embed_result = genai.embed_content(
+            model="models/gemini-embedding-2",
+            content=text_to_embed,
+            task_type="retrieval_document"
+        )
+        embedding = embed_result['embedding']
+        
+        doc_id = f"insight_{db_id}_{video_id}"
+        collection.add(
+            ids=[doc_id],
+            embeddings=[embedding],
+            metadatas=[{
+                "video_id": video_id,
+                "title": title if title else "제목 없음",
+                "video_url": video_url,
+                "created_at": published_at if published_at else "",
+                "user_id": user_id if user_id else -1
+            }],
+            documents=[text_to_embed]
+        )
+    except Exception as e:
+        print(f"[RAG ERROR] ChromaDB 저장 실패: {e}")
 
 
 def get_all_insights(user_id: int = None):
@@ -1902,16 +1935,18 @@ def main():
     if is_logged_in:
         init_stock_scheduler()
     
-    # 탭 구성: 로그인 상태에 따라 분기
+    # 기존 탭(st.tabs)과 유사한 디자인을 유지하면서 최적화(Lazy Loading)를 달성하기 위해 가로형 라디오 버튼 사용
     if is_logged_in:
-        tab1, tab2, tab3, tab4 = st.tabs(["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터", "📰 내 신문"])
+        menus = ["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터", "📰 내 신문", "💬 RAG 챗봇"]
     else:
-        tab1 = st.tabs(["🔗 URL 분석"])[0]
+        menus = ["🔗 URL 분석"]
+        
+    selected_menu = st.radio("📌 메뉴 선택", menus, horizontal=True, label_visibility="collapsed")
     
     # ============================================================
     # 탭 1: URL 직접 입력 분석
     # ============================================================
-    with tab1:
+    if selected_menu == "🔗 URL 분석":
         st.markdown("---")
         col1, col2 = st.columns([4, 1])
         
@@ -1990,8 +2025,7 @@ def main():
             except Exception as e:
                 st.error(f"❌ 오류: {str(e)}")
     
-    if is_logged_in:
-      with tab2:
+    elif selected_menu == "📺 구독 피드":
         st.markdown("---")
         
         # 조회 기간 선택
@@ -2079,8 +2113,7 @@ def main():
                     with cols[i % 3]:
                         render_video_card(video, user_id)
     
-    if is_logged_in:
-      with tab3:
+    elif selected_menu == "📈 주식 데이터":
         st.markdown("---")
         
         # 종목 추가 영역
@@ -2257,8 +2290,7 @@ def main():
         else:
             st.info("📭 종목을 먼저 추가해주세요.")
             
-    if is_logged_in:
-        with tab4:
+    elif selected_menu == "📰 내 신문":
             st.markdown("---")
             st.header("📰 나만의 인터넷 신문 발행소")
             st.markdown("저장된 분석(인사이트)들을 카테고리별로 모아 하나의 멋진 신문 기사를 만들어보세요.")
@@ -2334,6 +2366,83 @@ def main():
             else:
                 st.info("아직 발행된 신문이 없습니다.")
 
+
+    elif selected_menu == "💬 RAG 챗봇":
+        st.subheader("💬 내 지식베이스 챗봇 (RAG)")
+        st.write("지금까지 분석한 영상들의 내용을 바탕으로 무엇이든 물어보세요!")
+        
+        rag_query = st.text_input("질문 입력 (예: 엔비디아의 다음 세대 GPU에 대해 정리해줘)", key="rag_query")
+        
+        if st.button("질문하기", key="rag_submit"):
+            if not rag_query.strip():
+                st.warning("질문을 입력해주세요.")
+            else:
+                with st.spinner("지식베이스 검색 및 답변 생성 중..."):
+                    try:
+                        rag_api_key = st.session_state.get('api_key', '')
+                        if rag_api_key:
+                            genai.configure(api_key=rag_api_key)
+                        else:
+                            st.error("API 키가 설정되지 않았습니다. 사이드바에서 설정해주세요.")
+                            st.stop()
+
+                        # 1. ChromaDB 검색
+                        chroma_client = chromadb.PersistentClient(path='chroma_db')
+                        collection = chroma_client.get_or_create_collection(name="insights_collection")
+                        
+                        query_embed = genai.embed_content(
+                            model="models/gemini-embedding-2",
+                            content=rag_query,
+                            task_type="retrieval_query"
+                        )
+                        
+                        current_user_id = st.session_state.get('user_id')
+                        query_kwargs = {
+                            "query_embeddings": [query_embed['embedding']],
+                            "n_results": 3
+                        }
+                        if current_user_id:
+                            query_kwargs["where"] = {"user_id": current_user_id}
+                            
+                        results = collection.query(**query_kwargs)
+                        
+                        # 2. 배경 지식(Context) 구성
+                        context_docs = []
+                        if results and results['documents'] and len(results['documents'][0]) > 0:
+                            for idx, doc in enumerate(results['documents'][0]):
+                                meta = results['metadatas'][0][idx]
+                                video_title = meta.get("title", "제목 없음")
+                                context_docs.append(f"--- 문서 {idx+1} ({video_title}) ---\n{doc}")
+                        
+                        context_text = "\n\n".join(context_docs)
+                        
+                        if not context_docs:
+                            st.warning("관련된 문서가 DB에 없습니다.")
+                        else:
+                            # 3. LLM 프롬프트 생성
+                            rag_prompt = f"""당신은 사용자의 개인 지식베이스(세컨드 브레인)를 관리하는 AI 비서입니다.
+아래 제공된 [관련 지식 문서]들만을 바탕으로 사용자의 [질문]에 상세하고 친절하게 답변해주세요.
+문서에 없는 내용은 지어내지 말고, "제공된 지식베이스에는 관련 내용이 없습니다"라고 답변하세요.
+
+[관련 지식 문서]
+{context_text}
+
+[질문]
+{rag_query}
+"""
+                            # 4. 답변 생성
+                            model = genai.GenerativeModel('gemini-2.5-flash')
+                            response = model.generate_content(rag_prompt)
+                            
+                            # 5. 결과 출력
+                            st.markdown("### 💡 AI 답변")
+                            st.info(response.text)
+                            
+                            with st.expander("참고한 지식 문서 보기"):
+                                st.markdown(context_text)
+                            
+                    except Exception as e:
+                        st.error(f"RAG 검색/답변 중 오류가 발생했습니다: {e}")
 
 import sys
 def _dbg(msg):
