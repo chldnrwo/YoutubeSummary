@@ -1782,9 +1782,15 @@ def main():
                         col1, col2 = st.columns([5, 1])
                         with col1:
                             title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
-                            btn_label = f"💾 {title}"
+                            viewed = st.session_state.get('viewed_insights', set())
+                            is_viewed = insight['id'] in viewed
+                            icon = "✅" if is_viewed else "💾"
+                            btn_label = f"{icon} {title}"
                             if st.button(btn_label[:30] + ("..." if len(btn_label) > 30 else ""), key=f"{prefix}view_{insight['id']}", use_container_width=True):
                                 st.session_state['selected_insight_id'] = insight['id']
+                                if 'viewed_insights' not in st.session_state:
+                                    st.session_state['viewed_insights'] = set()
+                                st.session_state['viewed_insights'].add(insight['id'])
                                 st.rerun()
                         with col2:
                             if st.button("🗑️", key=f"{prefix}del_{insight['id']}"):
