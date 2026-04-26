@@ -2415,24 +2415,19 @@ def main():
                             task_type="retrieval_query"
                         )
                         
-                        # where 필터 구성
+                        # where 필터 구성 (ChromaDB는 숫자/문자열 exact match만 지원)
                         current_user_id = st.session_state.get('user_id')
                         where_conditions = []
                         
                         if current_user_id:
                             where_conditions.append({"user_id": current_user_id})
                         
-                        if rag_period != "전체":
-                            period_days = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30}
-                            cutoff_date = (datetime.utcnow() - timedelta(days=period_days[rag_period])).strftime("%Y-%m-%d")
-                            where_conditions.append({"created_at": {"$gte": cutoff_date}})
-                        
                         if rag_category != "전체":
                             where_conditions.append({"category": rag_category})
                         
                         query_kwargs = {
                             "query_embeddings": [query_embed['embedding']],
-                            "n_results": 10
+                            "n_results": 20  # 후처리 필터링을 위해 넉넉히 가져옴
                         }
                         if len(where_conditions) == 1:
                             query_kwargs["where"] = where_conditions[0]
@@ -2441,15 +2436,28 @@ def main():
                             
                         results = collection.query(**query_kwargs)
                         
-                        # 2. 배경 지식(Context) 구성
+                        # 2. 배경 지식(Context) 구성 + 날짜 후처리 필터링
                         context_docs = []
+                        cutoff_date = None
+                        if rag_period != "전체":
+                            period_days = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30}
+                            cutoff_date = (datetime.utcnow() - timedelta(days=period_days[rag_period])).strftime("%Y-%m-%d")
+                        
                         if results and results['documents'] and len(results['documents'][0]) > 0:
                             for idx, doc in enumerate(results['documents'][0]):
                                 meta = results['metadatas'][0][idx]
+                                doc_date = meta.get("created_at", "")[:10]
+                                
+                                # 날짜 필터 적용
+                                if cutoff_date and doc_date and doc_date < cutoff_date:
+                                    continue
+                                
                                 video_title = meta.get("title", "제목 없음")
                                 doc_category = meta.get("category", "")
-                                doc_date = meta.get("created_at", "")[:10]
-                                context_docs.append(f"--- 문서 {idx+1} | {video_title} | {doc_category} | {doc_date} ---\n{doc}")
+                                context_docs.append(f"--- 문서 {len(context_docs)+1} | {video_title} | {doc_category} | {doc_date} ---\n{doc}")
+                                
+                                if len(context_docs) >= 10:  # 최종 결과는 최대 10개
+                                    break
                         
                         context_text = "\n\n".join(context_docs)
                         
