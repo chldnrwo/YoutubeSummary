@@ -49,9 +49,9 @@ def migrate_data():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # insights 테이블에서 id, video_id, title, video_url, analysis_result, created_at, user_id 가져오기
+    # insights 테이블에서 id, video_id, title, video_url, analysis_result, created_at, user_id, category 가져오기
     try:
-        cursor.execute("SELECT id, video_id, title, video_url, analysis_result, created_at, user_id FROM insights")
+        cursor.execute("SELECT id, video_id, title, video_url, analysis_result, created_at, user_id, category FROM insights")
         rows = cursor.fetchall()
     except Exception as e:
         print(f"DB 읽기 에러: {e}")
@@ -71,7 +71,7 @@ def migrate_data():
     print(f"총 {len(rows)}개의 데이터를 ChromaDB로 마이그레이션합니다...")
     
     for row in tqdm(rows):
-        db_id, video_id, title, video_url, analysis_result, created_at, user_id = row
+        db_id, video_id, title, video_url, analysis_result, created_at, user_id, category = row
         
         doc_id = f"insight_{db_id}_{video_id}"
         
@@ -90,7 +90,8 @@ def migrate_data():
                     "title": title if title else "제목 없음",
                     "video_url": video_url,
                     "created_at": created_at if created_at else "",
-                    "user_id": user_id if user_id else -1
+                    "user_id": user_id if user_id else -1,
+                    "category": category if category else "그 외"
                 }],
                 documents=[text_to_embed]
             )

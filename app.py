@@ -341,7 +341,8 @@ def save_insight(video_id: str, video_url: str, title: str, transcript: str, ana
                 "title": title if title else "제목 없음",
                 "video_url": video_url,
                 "created_at": published_at if published_at else "",
-                "user_id": user_id if user_id else -1
+                "user_id": user_id if user_id else -1,
+                "category": category if category else "그 외"
             }],
             documents=[text_to_embed]
         )
@@ -2371,7 +2372,25 @@ def main():
         st.subheader("💬 내 지식베이스 챗봇 (RAG)")
         st.write("지금까지 분석한 영상들의 내용을 바탕으로 무엇이든 물어보세요!")
         
-        rag_query = st.text_input("질문 입력 (예: 엔비디아의 다음 세대 GPU에 대해 정리해줘)", key="rag_query")
+        # 필터 옵션
+        with st.expander("🔧 검색 필터 설정", expanded=False):
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                rag_period = st.selectbox(
+                    "📅 기간 필터",
+                    ["전체", "최근 7일", "최근 14일", "최근 30일"],
+                    index=0,
+                    key="rag_period"
+                )
+            with filter_col2:
+                rag_category = st.selectbox(
+                    "🏷️ 카테고리 필터",
+                    ["전체", "경제", "IT", "문화", "그 외"],
+                    index=0,
+                    key="rag_category"
+                )
+        
+        rag_query = st.text_input("질문 입력 (예: 최근 경제 영상들의 공통 메시지를 정리해줘)", key="rag_query")
         
         if st.button("질문하기", key="rag_submit"):
             if not rag_query.strip():
@@ -2396,13 +2415,29 @@ def main():
                             task_type="retrieval_query"
                         )
                         
+                        # where 필터 구성
                         current_user_id = st.session_state.get('user_id')
+                        where_conditions = []
+                        
+                        if current_user_id:
+                            where_conditions.append({"user_id": current_user_id})
+                        
+                        if rag_period != "전체":
+                            period_days = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30}
+                            cutoff_date = (datetime.utcnow() - timedelta(days=period_days[rag_period])).strftime("%Y-%m-%d")
+                            where_conditions.append({"created_at": {"$gte": cutoff_date}})
+                        
+                        if rag_category != "전체":
+                            where_conditions.append({"category": rag_category})
+                        
                         query_kwargs = {
                             "query_embeddings": [query_embed['embedding']],
-                            "n_results": 3
+                            "n_results": 10
                         }
-                        if current_user_id:
-                            query_kwargs["where"] = {"user_id": current_user_id}
+                        if len(where_conditions) == 1:
+                            query_kwargs["where"] = where_conditions[0]
+                        elif len(where_conditions) > 1:
+                            query_kwargs["where"] = {"$and": where_conditions}
                             
                         results = collection.query(**query_kwargs)
                         
@@ -2412,19 +2447,24 @@ def main():
                             for idx, doc in enumerate(results['documents'][0]):
                                 meta = results['metadatas'][0][idx]
                                 video_title = meta.get("title", "제목 없음")
-                                context_docs.append(f"--- 문서 {idx+1} ({video_title}) ---\n{doc}")
+                                doc_category = meta.get("category", "")
+                                doc_date = meta.get("created_at", "")[:10]
+                                context_docs.append(f"--- 문서 {idx+1} | {video_title} | {doc_category} | {doc_date} ---\n{doc}")
                         
                         context_text = "\n\n".join(context_docs)
                         
                         if not context_docs:
-                            st.warning("관련된 문서가 DB에 없습니다.")
+                            st.warning("조건에 맞는 문서가 없습니다. 필터를 넓혀서 다시 시도해보세요.")
                         else:
+                            st.caption(f"📚 {len(context_docs)}개의 관련 문서를 찾았습니다.")
+                            
                             # 3. LLM 프롬프트 생성
                             rag_prompt = f"""당신은 사용자의 개인 지식베이스(세컨드 브레인)를 관리하는 AI 비서입니다.
 아래 제공된 [관련 지식 문서]들만을 바탕으로 사용자의 [질문]에 상세하고 친절하게 답변해주세요.
+여러 문서에 걸친 공통점이나 트렌드를 묻는 질문이라면, 각 문서의 핵심을 종합하여 패턴과 공통 메시지를 분석해주세요.
 문서에 없는 내용은 지어내지 말고, "제공된 지식베이스에는 관련 내용이 없습니다"라고 답변하세요.
 
-[관련 지식 문서]
+[관련 지식 문서 ({len(context_docs)}개)]
 {context_text}
 
 [질문]
@@ -2438,7 +2478,7 @@ def main():
                             st.markdown("### 💡 AI 답변")
                             st.info(response.text)
                             
-                            with st.expander("참고한 지식 문서 보기"):
+                            with st.expander(f"참고한 지식 문서 보기 ({len(context_docs)}개)"):
                                 st.markdown(context_text)
                             
                     except Exception as e:
