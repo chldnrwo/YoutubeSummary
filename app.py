@@ -1035,6 +1035,12 @@ SYSTEM_INSTRUCTION = """
 
 💡 Deep Insight: 이 콘텐츠를 통해 얻을 수 있는 통찰이나 실생활 적용점
 
+[분량 규칙]
+- 자막이 길수록 소제목을 충분히 늘려서 (5~10개 이상) 핵심 정보를 절대 생략하지 마십시오.
+- 원본 자막에 등장하는 구체적 수치, 고유명사, 논리 전개를 빠짐없이 포함하십시오.
+- 원본의 정보 밀도에 비례하는 충분한 분량의 리포트를 작성하십시오. 절대 과도하게 축약하지 마십시오.
+- thinking(내부 추론)을 최소화하고, 실제 출력(analysis)에 토큰을 집중하십시오.
+
 언어: 한국어(Korean)
 
 스타일: 깊이 있는 매거진 기사 또는 전문 리포트 스타일
@@ -1202,14 +1208,27 @@ def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str, str]:
     
     # 자막 길이에 따라 비용 효율적인 모델 선택 (30,000자 기준)
     target_model_name = "gemini-2.5-flash-lite" if len(transcript) <= 30000 else "gemini-2.5-flash"
-    print(f"[DEBUG] 자막 길이: {len(transcript)}자 -> 사용 모델: {target_model_name}")
+    
+    # Gemini 2.5 모델은 thinking 토큰이 max_output_tokens에 포함됨
+    # thinking에 ~8,000 토큰을 사용하므로, 실제 출력을 위해 충분한 여유 필요
+    transcript_len = len(transcript)
+    if transcript_len <= 10000:
+        max_tokens = 16384    # 짧은 영상: thinking ~8K + 출력 ~8K
+    elif transcript_len <= 30000:
+        max_tokens = 32768    # 중간 영상: thinking ~8K + 출력 ~24K
+    elif transcript_len <= 60000:
+        max_tokens = 65536    # 긴 영상: thinking ~10K + 출력 ~55K
+    else:
+        max_tokens = 65536    # 매우 긴 영상: 최대값
+    
+    print(f"[DEBUG] 자막 길이: {len(transcript)}자 -> 사용 모델: {target_model_name}, max_output_tokens: {max_tokens}")
     
     model = genai.GenerativeModel(
         model_name=target_model_name,
         generation_config=genai.GenerationConfig(
             temperature=0,
             top_p=0.95,
-            max_output_tokens=8192,
+            max_output_tokens=max_tokens,
         ),
         system_instruction=SYSTEM_INSTRUCTION
     )
