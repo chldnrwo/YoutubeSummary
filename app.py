@@ -1842,10 +1842,37 @@ def main():
                         render_insight_list(week_insights, prefix="week_")
                         
                 if past_insights:
-                    with st.expander(f"**📂 과거 분석** ({len(past_insights)})"):
+                    PAGE_SIZE = 20
+                    total_pages = (len(past_insights) + PAGE_SIZE - 1) // PAGE_SIZE
+                    
+                    if 'past_page' not in st.session_state:
+                        st.session_state['past_page'] = 0
+                    current_page = st.session_state['past_page']
+                    current_page = max(0, min(current_page, total_pages - 1))
+                    
+                    start_idx = current_page * PAGE_SIZE
+                    end_idx = min(start_idx + PAGE_SIZE, len(past_insights))
+                    page_items = past_insights[start_idx:end_idx]
+                    
+                    with st.expander(f"**📂 과거 분석** ({len(past_insights)}개)", expanded=True):
                         _t = _time.time()
-                        render_insight_list(past_insights, prefix="past_")
-                        _dbg(f"[PERF] render past_insights ({len(past_insights)} items): {_time.time()-_t:.3f}s")
+                        
+                        # 페이지 네비게이션 (상단)
+                        if total_pages > 1:
+                            nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+                            with nav_col1:
+                                if st.button("◀ 이전", key="past_prev", disabled=(current_page == 0), use_container_width=True):
+                                    st.session_state['past_page'] = current_page - 1
+                                    st.rerun()
+                            with nav_col2:
+                                st.markdown(f"<div style='text-align:center; padding:5px;'>{current_page + 1} / {total_pages} 페이지</div>", unsafe_allow_html=True)
+                            with nav_col3:
+                                if st.button("다음 ▶", key="past_next", disabled=(current_page >= total_pages - 1), use_container_width=True):
+                                    st.session_state['past_page'] = current_page + 1
+                                    st.rerun()
+                        
+                        render_insight_list(page_items, prefix="past_")
+                        _dbg(f"[PERF] render past_insights ({len(page_items)}/{len(past_insights)} items, page {current_page+1}/{total_pages}): {_time.time()-_t:.3f}s")
             else:
                 st.caption("저장된 분석이 없습니다.")
         
