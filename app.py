@@ -1730,6 +1730,11 @@ def main():
             </style>
         """, unsafe_allow_html=True)
 
+        # 홈 버튼
+        if st.button("🏠 홈", key="home_btn", use_container_width=True):
+            st.session_state.pop('selected_insight_id', None)
+            st.rerun()
+
         # 로그인 상태 프로필 표시
         col_profile, col_logout = st.columns([3, 1])
         with col_profile:
