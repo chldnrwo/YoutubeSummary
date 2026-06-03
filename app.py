@@ -343,6 +343,29 @@ def get_rag_history(user_id: int, limit: int = 50) -> list:
     return history
 
 
+def get_all_rag_history(user_id: int) -> list:
+    """RAG 챗봇 대화 기록 전체를 역순(최신순)으로 반환합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT query, response, created_at
+        FROM rag_chat_history
+        WHERE user_id = ?
+        ORDER BY id DESC
+    """, (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    history = []
+    for row in rows:
+        history.append({
+            'query': row[0],
+            'response': row[1],
+            'created_at': row[2]
+        })
+    return history
+
+
 def clear_rag_history(user_id: int):
     """RAG 챗봇 대화 기록을 초기화합니다."""
     conn = sqlite3.connect(DB_PATH)
@@ -2593,126 +2616,141 @@ def main():
         st.subheader("💬 내 지식베이스 챗봇 (RAG)")
         st.write("지금까지 분석한 영상들의 내용을 바탕으로 무엇이든 물어보세요!")
         
+        tab_chat, tab_log = st.tabs(["💬 챗봇", "📚 대화 기록 열람"])
         user_id = st.session_state.get('user_id')
         
-        # 필터 옵션 및 대화 관리
-        with st.expander("🔧 검색 필터 및 설정", expanded=False):
-            filter_col1, filter_col2, filter_col3 = st.columns([3, 3, 2])
-            with filter_col1:
-                rag_period = st.selectbox(
-                    "📅 기간 필터",
-                    ["전체", "최근 7일", "최근 14일", "최근 30일"],
-                    index=0,
-                    key="rag_period"
-                )
-            with filter_col2:
-                rag_category = st.selectbox(
-                    "🏷️ 카테고리 필터",
-                    ["전체", "경제", "IT", "문화", "그 외"],
-                    index=0,
-                    key="rag_category"
-                )
-            with filter_col3:
-                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                if st.button("🗑️ 대화 초기화", use_container_width=True, key="clear_chat"):
-                    st.session_state.rag_messages = []
-                    if user_id:
-                        clear_rag_history(user_id)
-                    st.toast("대화 기록이 초기화되었습니다. 🗑️")
-                    st.rerun()
-
-        # 1. 이전 대화 기록 로드 및 출력
-        if 'rag_messages' not in st.session_state:
-            st.session_state.rag_messages = get_rag_history(user_id) if user_id else []
-            
-        chat_history = st.session_state.rag_messages
-        for chat in chat_history:
-            with st.chat_message("user"):
-                st.write(chat['query'])
-            with st.chat_message("assistant"):
-                st.write(chat['response'])
-                
-        # 2. 새로운 질문 입력 받기
-        rag_query = st.chat_input("질문을 입력하세요 (예: 최근 경제 영상들의 공통 메시지를 정리해줘)...")
-        
-        if rag_query:
-            # 질문 즉시 렌더링
-            with st.chat_message("user"):
-                st.write(rag_query)
-                
-            # 답변 생성 및 렌더링
-            with st.chat_message("assistant"):
-                with st.spinner("지식베이스 검색 및 답변 생성 중..."):
-                    try:
-                        rag_api_key = st.session_state.get('api_key', '')
-                        if rag_api_key:
-                            genai.configure(api_key=rag_api_key)
-                        else:
-                            st.error("API 키가 설정되지 않았습니다. 사이드바에서 설정해주세요.")
-                            st.stop()
- 
-                        # (1) ChromaDB 검색
-                        chroma_client = chromadb.PersistentClient(path='chroma_db')
-                        collection = chroma_client.get_or_create_collection(name="insights_collection")
-                        
-                        query_embed = genai.embed_content(
-                            model="models/gemini-embedding-2",
-                            content=rag_query,
-                            task_type="retrieval_query"
-                        )
-                        
-                        # where 필터 구성
-                        where_conditions = []
-                        if user_id:
-                            where_conditions.append({"user_id": user_id})
-                        
-                        if rag_category != "전체":
-                            where_conditions.append({"category": rag_category})
-                        
-                        query_kwargs = {
-                            "query_embeddings": [query_embed['embedding']],
-                            "n_results": 20
-                        }
-                        if len(where_conditions) == 1:
-                            query_kwargs["where"] = where_conditions[0]
-                        elif len(where_conditions) > 1:
-                            query_kwargs["where"] = {"$and": where_conditions}
+        with tab_log:
+            st.markdown("### 📚 과거 대화 전체 기록")
+            if not user_id:
+                st.warning("로그인이 필요한 기능입니다.")
+            else:
+                all_history = get_all_rag_history(user_id)
+                if not all_history:
+                    st.info("아직 저장된 대화 기록이 없습니다.")
+                else:
+                    for h in all_history:
+                        with st.expander(f"Q: {h['query']} ({h['created_at'][:16]})"):
+                            st.markdown(f"**답변:**\n{h['response']}")
                             
-                        results = collection.query(**query_kwargs)
-                        
-                        # (2) 배경 지식(Context) 구성 + 날짜 후처리 필터링
-                        context_docs = []
-                        cutoff_date = None
-                        if rag_period != "전체":
-                            period_days = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30}
-                            cutoff_date = (datetime.utcnow() - timedelta(days=period_days[rag_period])).strftime("%Y-%m-%d")
-                        
-                        if results and results['documents'] and len(results['documents'][0]) > 0:
-                            for idx, doc in enumerate(results['documents'][0]):
-                                meta = results['metadatas'][0][idx]
-                                doc_date = meta.get("created_at", "")[:10]
-                                
-                                # 날짜 필터 적용
-                                if cutoff_date and doc_date and doc_date < cutoff_date:
-                                    continue
-                                
-                                video_title = meta.get("title", "제목 없음")
-                                doc_category = meta.get("category", "")
-                                context_docs.append(f"--- 문서 {len(context_docs)+1} | {video_title} | {doc_category} | {doc_date} ---\n{doc}")
-                                
-                                if len(context_docs) >= 10:
-                                    break
-                        
-                        context_text = "\n\n".join(context_docs)
-                        
-                        if not context_docs:
-                            response_text = "선택하신 조건(필터)에 부합하는 분석 문서가 지식베이스에 없습니다. 필터를 변경하여 다시 질문해주세요."
-                            st.warning(response_text)
+        with tab_chat:
+            # 필터 옵션 및 대화 관리
+            with st.expander("🔧 검색 필터 및 설정", expanded=False):
+                filter_col1, filter_col2, filter_col3 = st.columns([3, 3, 2])
+                with filter_col1:
+                    rag_period = st.selectbox(
+                        "📅 기간 필터",
+                        ["전체", "최근 7일", "최근 14일", "최근 30일"],
+                        index=0,
+                        key="rag_period"
+                    )
+                with filter_col2:
+                    rag_category = st.selectbox(
+                        "🏷️ 카테고리 필터",
+                        ["전체", "경제", "IT", "문화", "그 외"],
+                        index=0,
+                        key="rag_category"
+                    )
+                with filter_col3:
+                    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                    if st.button("🗑️ 대화 초기화", use_container_width=True, key="clear_chat"):
+                        st.session_state.rag_messages = []
+                        if user_id:
+                            clear_rag_history(user_id)
+                        st.toast("대화 기록이 초기화되었습니다. 🗑️")
+                        st.rerun()
+
+            # 1. 이전 대화 기록 로드 및 출력
+            if 'rag_messages' not in st.session_state:
+                st.session_state.rag_messages = get_rag_history(user_id) if user_id else []
+                
+            chat_history = st.session_state.rag_messages
+            for chat in chat_history:
+                with st.chat_message("user"):
+                    st.write(chat['query'])
+                with st.chat_message("assistant"):
+                    st.write(chat['response'])
+                    
+            # 2. 새로운 질문 입력 받기
+            rag_query = st.chat_input("질문을 입력하세요 (예: 최근 경제 영상들의 공통 메시지를 정리해줘)...")
+            
+            if rag_query:
+                # 질문 즉시 렌더링
+                with st.chat_message("user"):
+                    st.write(rag_query)
+                    
+                # 답변 생성 및 렌더링
+                with st.chat_message("assistant"):
+                    with st.spinner("지식베이스 검색 및 답변 생성 중..."):
+                        try:
+                            rag_api_key = st.session_state.get('api_key', '')
+                            if rag_api_key:
+                                genai.configure(api_key=rag_api_key)
+                            else:
+                                st.error("API 키가 설정되지 않았습니다. 사이드바에서 설정해주세요.")
+                                st.stop()
+ 
+                            # (1) ChromaDB 검색
+                            chroma_client = chromadb.PersistentClient(path='chroma_db')
+                            collection = chroma_client.get_or_create_collection(name="insights_collection")
+                            
+                            query_embed = genai.embed_content(
+                                model="models/gemini-embedding-2",
+                                content=rag_query,
+                                task_type="retrieval_query"
+                            )
+                            
+                            # where 필터 구성
+                            where_conditions = []
                             if user_id:
-                                save_rag_chat(user_id, rag_query, response_text)
-                        else:
-                            # (3) LLM 프롬프트 생성
-                            rag_prompt = f"""당신은 사용자의 개인 지식베이스(세컨드 브레인)를 관리하는 AI 비서입니다.
+                                where_conditions.append({"user_id": user_id})
+                            
+                            if rag_category != "전체":
+                                where_conditions.append({"category": rag_category})
+                            
+                            query_kwargs = {
+                                "query_embeddings": [query_embed['embedding']],
+                                "n_results": 20
+                            }
+                            if len(where_conditions) == 1:
+                                query_kwargs["where"] = where_conditions[0]
+                            elif len(where_conditions) > 1:
+                                query_kwargs["where"] = {"$and": where_conditions}
+                                
+                            results = collection.query(**query_kwargs)
+                            
+                            # (2) 배경 지식(Context) 구성 + 날짜 후처리 필터링
+                            context_docs = []
+                            cutoff_date = None
+                            if rag_period != "전체":
+                                period_days = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30}
+                                cutoff_date = (datetime.utcnow() - timedelta(days=period_days[rag_period])).strftime("%Y-%m-%d")
+                            
+                            if results and results['documents'] and len(results['documents'][0]) > 0:
+                                for idx, doc in enumerate(results['documents'][0]):
+                                    meta = results['metadatas'][0][idx]
+                                    doc_date = meta.get("created_at", "")[:10]
+                                    
+                                    # 날짜 필터 적용
+                                    if cutoff_date and doc_date and doc_date < cutoff_date:
+                                        continue
+                                    
+                                    video_title = meta.get("title", "제목 없음")
+                                    doc_category = meta.get("category", "")
+                                    context_docs.append(f"--- 문서 {len(context_docs)+1} | {video_title} | {doc_category} | {doc_date} ---\n{doc}")
+                                    
+                                    if len(context_docs) >= 10:
+                                        break
+                            
+                            context_text = "\n\n".join(context_docs)
+                            
+                            if not context_docs:
+                                response_text = "선택하신 조건(필터)에 부합하는 분석 문서가 지식베이스에 없습니다. 필터를 변경하여 다시 질문해주세요."
+                                st.warning(response_text)
+                                if user_id:
+                                    save_rag_chat(user_id, rag_query, response_text)
+                            else:
+                                # (3) LLM 프롬프트 생성
+                                rag_prompt = f"""당신은 사용자의 개인 지식베이스(세컨드 브레인)를 관리하는 AI 비서입니다.
 아래 제공된 [관련 지식 문서]들만을 바탕으로 사용자의 [질문]에 상세하고 친절하게 답변해주세요.
 여러 문서에 걸친 공통점이나 트렌드를 묻는 질문이라면, 각 문서의 핵심을 종합하여 패턴과 공통 메시지를 분석해주세요.
 문서에 없는 내용은 지어내지 말고, "제공된 지식베이스에는 관련 내용이 없습니다"라고 답변하세요.
@@ -2723,25 +2761,25 @@ def main():
 [질문]
 {rag_query}
 """
-                            # (4) 답변 생성
-                            model = genai.GenerativeModel('gemini-2.5-flash')
-                            response = model.generate_content(rag_prompt)
-                            response_text = response.text
-                            
-                            # (5) 결과 출력
-                            st.write(response_text)
-                            
-                            st.session_state.rag_messages.append({'query': rag_query, 'response': response_text})
-                            
-                            with st.expander(f"참고한 지식 문서 보기 ({len(context_docs)}개)"):
-                                st.markdown(context_text)
+                                # (4) 답변 생성
+                                model = genai.GenerativeModel('gemini-2.5-flash')
+                                response = model.generate_content(rag_prompt)
+                                response_text = response.text
                                 
-                            # DB 저장
-                            if user_id:
-                                save_rag_chat(user_id, rag_query, response_text)
-                            
-                    except Exception as e:
-                        st.error(f"RAG 검색/답변 중 오류가 발생했습니다: {e}")
+                                # (5) 결과 출력
+                                st.write(response_text)
+                                
+                                st.session_state.rag_messages.append({'query': rag_query, 'response': response_text})
+                                
+                                with st.expander(f"참고한 지식 문서 보기 ({len(context_docs)}개)"):
+                                    st.markdown(context_text)
+                                    
+                                # DB 저장
+                                if user_id:
+                                    save_rag_chat(user_id, rag_query, response_text)
+                                
+                        except Exception as e:
+                            st.error(f"RAG 검색/답변 중 오류가 발생했습니다: {e}")
 
 import sys
 def _dbg(msg):
