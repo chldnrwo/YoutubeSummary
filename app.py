@@ -1838,8 +1838,32 @@ def main():
                     render_insight_list(today_insights, prefix="today_")
                     
                 if week_insights:
-                    with st.expander(f"**🔸 금주 분석** ({len(week_insights)})"):
-                        render_insight_list(week_insights, prefix="week_")
+                    WEEK_PAGE_SIZE = 20
+                    week_total_pages = (len(week_insights) + WEEK_PAGE_SIZE - 1) // WEEK_PAGE_SIZE
+                    
+                    if 'week_page' not in st.session_state:
+                        st.session_state['week_page'] = 0
+                    week_current_page = st.session_state['week_page']
+                    week_current_page = max(0, min(week_current_page, week_total_pages - 1))
+                    
+                    week_start = week_current_page * WEEK_PAGE_SIZE
+                    week_end = min(week_start + WEEK_PAGE_SIZE, len(week_insights))
+                    week_page_items = week_insights[week_start:week_end]
+                    
+                    with st.expander(f"**🔸 금주 분석** ({len(week_insights)}개)"):
+                        if week_total_pages > 1:
+                            wn1, wn2, wn3 = st.columns([1, 2, 1])
+                            with wn1:
+                                if st.button("◀ 이전", key="week_prev", disabled=(week_current_page == 0), use_container_width=True):
+                                    st.session_state['week_page'] = week_current_page - 1
+                                    st.rerun()
+                            with wn2:
+                                st.markdown(f"<div style='text-align:center; padding:5px;'>{week_current_page + 1} / {week_total_pages} 페이지</div>", unsafe_allow_html=True)
+                            with wn3:
+                                if st.button("다음 ▶", key="week_next", disabled=(week_current_page >= week_total_pages - 1), use_container_width=True):
+                                    st.session_state['week_page'] = week_current_page + 1
+                                    st.rerun()
+                        render_insight_list(week_page_items, prefix="week_")
                         
                 if past_insights:
                     PAGE_SIZE = 20
@@ -1854,7 +1878,7 @@ def main():
                     end_idx = min(start_idx + PAGE_SIZE, len(past_insights))
                     page_items = past_insights[start_idx:end_idx]
                     
-                    with st.expander(f"**📂 과거 분석** ({len(past_insights)}개)", expanded=True):
+                    with st.expander(f"**📂 과거 분석** ({len(past_insights)}개)", expanded=False):
                         _t = _time.time()
                         
                         # 페이지 네비게이션 (상단)
