@@ -1834,7 +1834,7 @@ def main():
                                 st.rerun()
 
                 if today_insights:
-                    st.markdown("**🔹 오늘 분석**")
+                    st.markdown(f"**🔹 오늘 분석** ({len(today_insights)}개)")
                     render_insight_list(today_insights, prefix="today_")
                     
                 if week_insights:
