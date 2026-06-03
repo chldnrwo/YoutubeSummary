@@ -2615,15 +2615,17 @@ def main():
             with filter_col3:
                 st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
                 if st.button("🗑️ 대화 초기화", use_container_width=True, key="clear_chat"):
+                    st.session_state.rag_messages = []
                     if user_id:
                         clear_rag_history(user_id)
-                        st.toast("대화 기록이 초기화되었습니다. 🗑️")
-                        st.rerun()
-                    else:
-                        st.warning("로그인이 필요합니다.")
+                    st.toast("대화 기록이 초기화되었습니다. 🗑️")
+                    st.rerun()
 
         # 1. 이전 대화 기록 로드 및 출력
-        chat_history = get_rag_history(user_id) if user_id else []
+        if 'rag_messages' not in st.session_state:
+            st.session_state.rag_messages = get_rag_history(user_id) if user_id else []
+            
+        chat_history = st.session_state.rag_messages
         for chat in chat_history:
             with st.chat_message("user"):
                 st.write(chat['query'])
@@ -2728,6 +2730,8 @@ def main():
                             
                             # (5) 결과 출력
                             st.write(response_text)
+                            
+                            st.session_state.rag_messages.append({'query': rag_query, 'response': response_text})
                             
                             with st.expander(f"참고한 지식 문서 보기 ({len(context_docs)}개)"):
                                 st.markdown(context_text)
