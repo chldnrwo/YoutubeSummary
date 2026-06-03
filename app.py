@@ -350,22 +350,24 @@ def save_insight(video_id: str, video_url: str, title: str, transcript: str, ana
         print(f"[RAG ERROR] ChromaDB 저장 실패: {e}")
 
 
-def get_all_insights(user_id: int = None):
+def get_all_insights(user_id: int = None, include_analysis: bool = False):
     """저장된 분석 결과를 조회합니다. user_id가 주어지면 해당 사용자 것만."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
+    columns = "id, video_id, video_url, title, analysis_result, created_at, published_at, category" if include_analysis else "id, video_id, video_url, title, created_at, published_at, category"
+    
     if user_id is not None:
-        cursor.execute("""
-            SELECT id, video_id, video_url, title, analysis_result, created_at, published_at, category
+        cursor.execute(f"""
+            SELECT {columns}
             FROM insights
             WHERE user_id = ?
             ORDER BY created_at DESC
         """, (user_id,))
     else:
-        cursor.execute("""
-            SELECT id, video_id, video_url, title, analysis_result, created_at, published_at, category
+        cursor.execute(f"""
+            SELECT {columns}
             FROM insights
             ORDER BY created_at DESC
         """)
@@ -2344,7 +2346,7 @@ def main():
                 
             if publish_btn:
                 # 1. 지정된 기간 내의 insights 조회
-                all_insights = get_all_insights(user_id=user_id)
+                all_insights = get_all_insights(user_id=user_id, include_analysis=True)
                 target_insights = []
                 for ins in all_insights:
                     if not ins['published_at']:
