@@ -1470,7 +1470,11 @@ def render_video_card(video: dict, user_id: int):
 # ============================================================
 def main():
     """메인 애플리케이션 로직"""
+    import time as _time
+    _perf_start = _time.time()
+    
     init_database()
+    _dbg(f"[PERF] init_database: {_time.time()-_perf_start:.3f}s")
     
     # 설정 파일 로드
     default_api_key = ""
@@ -1583,8 +1587,10 @@ def main():
         # 이미 로그인된 상태에서 OAuth 파라미터가 남아있으면 정리
         st.query_params.clear()
     # ============================================================
+    _t = _time.time()
     youtube = get_youtube_client()
     is_logged_in = youtube is not None
+    _dbg(f"[PERF] get_youtube_client: {_time.time()-_t:.3f}s")
     user_info = None
     user_id = None
     
@@ -1773,7 +1779,9 @@ def main():
                 if st.button("🔄", key="refresh_insights", help="분석 목록 새로고침"):
                     st.rerun()
             
+            _t = _time.time()
             insights = get_all_insights(user_id=user_id)
+            _dbg(f"[PERF] get_all_insights ({len(insights)} rows): {_time.time()-_t:.3f}s")
             
             if insights:
                 today_insights = []
@@ -1835,7 +1843,9 @@ def main():
                         
                 if past_insights:
                     with st.expander(f"**📂 과거 분석** ({len(past_insights)})"):
+                        _t = _time.time()
                         render_insight_list(past_insights, prefix="past_")
+                        _dbg(f"[PERF] render past_insights ({len(past_insights)} items): {_time.time()-_t:.3f}s")
             else:
                 st.caption("저장된 분석이 없습니다.")
         
@@ -1845,6 +1855,7 @@ def main():
     # ============================================================
     # 메인 화면
     # ============================================================
+    _dbg(f"[PERF] sidebar 완료: {_time.time()-_perf_start:.3f}s")
     st.title("🔍 Insight Pipeline")
     st.markdown("*YouTube 영상을 심층 분석하여 핵심 지식을 추출합니다.*")
     
@@ -1873,7 +1884,9 @@ def main():
             height=0
         )
         
+        _t = _time.time()
         insight = get_insight_by_id(selected_id)
+        _dbg(f"[PERF] get_insight_by_id: {_time.time()-_t:.3f}s")
         
         if insight:
             title = insight['title'] if insight['title'] else "분석 결과"
