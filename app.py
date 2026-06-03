@@ -2617,7 +2617,6 @@ def main():
         st.write("지금까지 분석한 영상들의 내용을 바탕으로 무엇이든 물어보세요!")
         
         tab_chat, tab_log = st.tabs(["💬 챗봇", "📚 대화 기록 열람"])
-        user_id = st.session_state.get('user_id')
         
         with tab_log:
             st.markdown("### 📚 과거 대화 전체 기록")
