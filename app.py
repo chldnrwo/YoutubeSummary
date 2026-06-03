@@ -239,6 +239,18 @@ def init_database():
         )
     """)
     
+    # 분석 읽음(확인) 상태 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS read_insights (
+            user_id INTEGER NOT NULL,
+            insight_id INTEGER NOT NULL,
+            read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, insight_id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (insight_id) REFERENCES insights(id) ON DELETE CASCADE
+        )
+    """)
+    
     conn.commit()
     conn.close()
 
@@ -348,6 +360,8 @@ def save_insight(video_id: str, video_url: str, title: str, transcript: str, ana
         )
     except Exception as e:
         print(f"[RAG ERROR] ChromaDB 저장 실패: {e}")
+        
+    return db_id
 
 
 def get_all_insights(user_id: int = None, include_analysis: bool = False):
@@ -428,10 +442,33 @@ def delete_insight(insight_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
+    cursor.execute("DELETE FROM read_insights WHERE insight_id = ?", (insight_id,))
     cursor.execute("DELETE FROM insights WHERE id = ?", (insight_id,))
     
     conn.commit()
     conn.close()
+
+
+def mark_insight_as_read(user_id: int, insight_id: int):
+    """특정 분석 결과를 읽음 상태로 표시합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR IGNORE INTO read_insights (user_id, insight_id)
+        VALUES (?, ?)
+    """, (user_id, insight_id))
+    conn.commit()
+    conn.close()
+
+
+def get_read_insight_ids(user_id: int) -> set:
+    """사용자가 읽은 분석 결과 ID 집합을 가져옵니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT insight_id FROM read_insights WHERE user_id = ?", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return {row[0] for row in rows}
 
 
 def hide_video(video_id: str, user_id: int = None):
@@ -1619,6 +1656,12 @@ def main():
         
         if user_info:
             user_id = user_info['user_id']
+            if 'viewed_insights' not in st.session_state:
+                try:
+                    st.session_state['viewed_insights'] = get_read_insight_ids(user_id)
+                except Exception as e:
+                    print(f"[DB ERROR] 읽은 분석 목록 로드 실패: {e}")
+                    st.session_state['viewed_insights'] = set()
     
     # ============================================================
     # 🔒 보안 게이트: 구글 로그인 없으면 클로킹 페이지로 차단
@@ -1832,6 +1875,10 @@ def main():
                                 if 'viewed_insights' not in st.session_state:
                                     st.session_state['viewed_insights'] = set()
                                 st.session_state['viewed_insights'].add(insight['id'])
+                                try:
+                                    mark_insight_as_read(user_id, insight['id'])
+                                except Exception as e:
+                                    print(f"[DB ERROR] 읽음 처리 기록 실패: {e}")
                                 st.rerun()
                         with col2:
                             if st.button("🗑️", key=f"{prefix}del_{insight['id']}"):
@@ -2098,7 +2145,14 @@ def main():
                 
                 # 로그인 상태에서만 DB에 저장
                 if is_logged_in and user_id:
-                    save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=None, category=category)
+                    db_id = save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=None, category=category)
+                    if db_id:
+                        try:
+                            mark_insight_as_read(user_id, db_id)
+                            if 'viewed_insights' in st.session_state:
+                                st.session_state['viewed_insights'].add(db_id)
+                        except Exception as e:
+                            print(f"[DB ERROR] 분석 생성 시 읽음 처리 실패: {e}")
                     st.success(f"✅ '{title}' 저장 완료!")
                 else:
                     st.info("💡 로그인하면 분석 결과가 자동 저장됩니다.")
