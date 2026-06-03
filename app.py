@@ -2708,7 +2708,6 @@ def main():
                             st.warning(response_text)
                             if user_id:
                                 save_rag_chat(user_id, rag_query, response_text)
-                            st.rerun()
                         else:
                             # (3) LLM 프롬프트 생성
                             rag_prompt = f"""당신은 사용자의 개인 지식베이스(세컨드 브레인)를 관리하는 AI 비서입니다.
@@ -2736,7 +2735,6 @@ def main():
                             # DB 저장
                             if user_id:
                                 save_rag_chat(user_id, rag_query, response_text)
-                            st.rerun()
                             
                     except Exception as e:
                         st.error(f"RAG 검색/답변 중 오류가 발생했습니다: {e}")
