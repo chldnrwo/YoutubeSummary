@@ -2658,28 +2658,33 @@ def main():
                         st.toast("대화 기록이 초기화되었습니다. 🗑️")
                         st.rerun()
 
-            # 1. 이전 대화 기록 로드 및 출력
+            # 1. 채팅 영역 컨테이너 생성 (입력창보다 위에 메시지가 고정되도록 함)
+            chat_container = st.container()
+
+            # 2. 이전 대화 기록 로드 및 출력
             if 'rag_messages' not in st.session_state:
                 st.session_state.rag_messages = get_rag_history(user_id) if user_id else []
                 
-            chat_history = st.session_state.rag_messages
-            for chat in chat_history:
-                with st.chat_message("user"):
-                    st.write(chat['query'])
-                with st.chat_message("assistant"):
-                    st.write(chat['response'])
+            with chat_container:
+                chat_history = st.session_state.rag_messages
+                for chat in chat_history:
+                    with st.chat_message("user"):
+                        st.write(chat['query'])
+                    with st.chat_message("assistant"):
+                        st.write(chat['response'])
                     
-            # 2. 새로운 질문 입력 받기
+            # 3. 새로운 질문 입력 받기
             rag_query = st.chat_input("질문을 입력하세요 (예: 최근 경제 영상들의 공통 메시지를 정리해줘)...")
             
             if rag_query:
-                # 질문 즉시 렌더링
-                with st.chat_message("user"):
-                    st.write(rag_query)
-                    
-                # 답변 생성 및 렌더링
-                with st.chat_message("assistant"):
-                    with st.spinner("지식베이스 검색 및 답변 생성 중..."):
+                with chat_container:
+                    # 질문 즉시 렌더링
+                    with st.chat_message("user"):
+                        st.write(rag_query)
+                        
+                    # 답변 생성 및 렌더링
+                    with st.chat_message("assistant"):
+                        with st.spinner("지식베이스 검색 및 답변 생성 중..."):
                         try:
                             rag_api_key = st.session_state.get('api_key', '')
                             if rag_api_key:
