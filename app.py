@@ -1328,12 +1328,17 @@ def get_transcript(video_id: str) -> str:
             raise Exception(f"자막 추출 중 오류 발생: {error_msg}")
 
 
-def analyze_with_gemini(transcript: str, api_key: str) -> tuple[str, str, str]:
+def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None) -> tuple[str, str, str]:
     """Gemini를 사용하여 자막 텍스트를 분석합니다."""
     genai.configure(api_key=api_key)
     
-    # 자막 길이에 따라 비용 효율적인 모델 선택 (30,000자 기준)
-    target_model_name = "gemini-2.5-flash-lite" if len(transcript) <= 30000 else "gemini-2.5-flash"
+    if force_model == "gemini-2.5-flash":
+        target_model_name = "gemini-2.5-flash"
+    elif force_model == "gemini-2.5-flash-lite":
+        target_model_name = "gemini-2.5-flash-lite"
+    else:
+        # 자막 길이에 따라 비용 효율적인 모델 선택 (30,000자 기준 자동 모드)
+        target_model_name = "gemini-2.5-flash-lite" if len(transcript) <= 30000 else "gemini-2.5-flash"
     
     # Gemini 2.5 모델은 thinking 토큰이 max_output_tokens에 포함됨
     # thinking에 ~8,000 토큰을 사용하므로, 실제 출력을 위해 충분한 여유 필요
@@ -1452,16 +1457,16 @@ def generate_newspaper_section(category: str, insights_text: str, api_key: str) 
         return f"🚨 기사 작성 중 오류가 발생했습니다: {e}"
 
 
-def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None) -> tuple[str, str, str]:
+def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None) -> tuple[str, str, str]:
     """영상을 분석하고 결과를 반환합니다."""
     transcript = get_transcript(video_id)
-    title, category, analysis = analyze_with_gemini(transcript, api_key)
+    title, category, analysis = analyze_with_gemini(transcript, api_key, force_model=force_model)
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at, category=category)
     return title, category, analysis
 
 
-def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None):
+def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None):
     """영상 분석을 ThreadPoolExecutor에 제출합니다."""
     with _analysis_lock:
         # 이미 진행 중이거나 완료된 경우 스킵
@@ -1473,7 +1478,7 @@ def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_
         try:
             with _analysis_lock:
                 _analysis_status[video_id] = 'running'
-            analyze_video(video_id, api_key, user_id=user_id, published_at=published_at)
+            analyze_video(video_id, api_key, user_id=user_id, published_at=published_at, force_model=force_model)
             with _analysis_lock:
                 _analysis_status[video_id] = 'done'
         except Exception as e:
@@ -2155,7 +2160,7 @@ def main():
             st.markdown("---")
             st.markdown(display_analysis)
             
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
                 st.download_button(
                     label="📄 Markdown으로 다운로드",
@@ -2164,9 +2169,45 @@ def main():
                     mime="text/markdown"
                 )
             with col2:
-                if st.button("🔙 돌아가기"):
+                if st.button("🔄 재분석", use_container_width=True):
+                    st.session_state['show_reanalyze'] = not st.session_state.get('show_reanalyze', False)
+            with col3:
+                if st.button("🔙 돌아가기", use_container_width=True):
                     del st.session_state['selected_insight_id']
+                    st.session_state.pop('show_reanalyze', None)
                     st.rerun()
+            
+            if st.session_state.get('show_reanalyze'):
+                st.markdown("---")
+                st.info("💡 모델을 변경하여 이 영상을 다시 분석하고 결과를 덮어씁니다.")
+                re_model_opt = st.selectbox(
+                    "재분석 모델", 
+                    ["Gemini 2.5 Flash (고품질)", "Gemini 2.5 Flash Lite (저비용)"], 
+                    index=0,
+                    key="reanalyze_model_select"
+                )
+                if st.button("🚀 선택한 모델로 다시 돌리기", type="primary"):
+                    force_val = "gemini-2.5-flash" if "Flash (" in re_model_opt else "gemini-2.5-flash-lite"
+                    api_key = st.session_state.get('api_key', '')
+                    if not api_key:
+                        st.error("API Key가 설정되어 있지 않습니다.")
+                    else:
+                        with st.spinner("🤖 재분석 중... (완료 시 자동 새로고침)"):
+                            try:
+                                transcript = get_transcript(insight['video_id'])
+                                new_title, new_cat, new_analysis = analyze_with_gemini(transcript, api_key, force_model=force_val)
+                                
+                                conn = sqlite3.connect(DB_PATH)
+                                cursor = conn.cursor()
+                                cursor.execute("UPDATE insights SET title = ?, category = ?, analysis_result = ? WHERE id = ?", 
+                                               (new_title, new_cat, new_analysis, selected_id))
+                                conn.commit()
+                                conn.close()
+                                
+                                st.session_state.pop('show_reanalyze', None)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"재분석 실패: {str(e)}")
             return
     
     # 주식 스케줄러 시작
@@ -2186,16 +2227,22 @@ def main():
     # ============================================================
     if selected_menu == "🔗 URL 분석":
         st.markdown("---")
-        col1, col2 = st.columns([4, 1])
         
-        with col1:
-            youtube_url = st.text_input(
-                "📺 YouTube URL",
-                placeholder="https://www.youtube.com/watch?v=...",
+        youtube_url = st.text_input(
+            "📺 YouTube URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+            label_visibility="collapsed"
+        )
+        
+        col_model, col_btn = st.columns([4, 1])
+        with col_model:
+            selected_model_option = st.selectbox(
+                "분석 모델 선택",
+                options=["자동 (길이 기준 최적화)", "Gemini 2.5 Flash (고품질, 권장)", "Gemini 2.5 Flash Lite (저비용)"],
+                index=0,
                 label_visibility="collapsed"
             )
-        
-        with col2:
+        with col_btn:
             analyze_button = st.button("🚀 분석 시작", use_container_width=True)
         
         if analyze_button:
@@ -2225,9 +2272,16 @@ def main():
                     )
                 
                 with st.spinner("🤖 AI 분석 중..."):
+                    force_model_val = None
+                    if "Flash Lite" in selected_model_option:
+                        force_model_val = "gemini-2.5-flash-lite"
+                    elif "Flash" in selected_model_option:
+                        force_model_val = "gemini-2.5-flash"
+                        
                     title, category, analysis_result = analyze_with_gemini(
                         transcript, 
-                        st.session_state['api_key']
+                        st.session_state['api_key'],
+                        force_model=force_model_val
                     )
                 
                 # 로그인 상태에서만 DB에 저장
