@@ -2175,7 +2175,7 @@ def main():
     
     # 기존 탭(st.tabs)과 유사한 디자인을 유지하면서 최적화(Lazy Loading)를 달성하기 위해 가로형 라디오 버튼 사용
     if is_logged_in:
-        menus = ["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터", "📰 내 신문", "💬 RAG 챗봇"]
+        menus = ["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터", "📰 내 신문", "📋 요약 데이터", "💬 RAG 챗봇"]
     else:
         menus = ["🔗 URL 분석"]
         
@@ -2611,6 +2611,114 @@ def main():
             else:
                 st.info("아직 발행된 신문이 없습니다.")
 
+
+    elif selected_menu == "📋 요약 데이터":
+        st.markdown("---")
+        st.header("📋 유튜브 요약 Raw 데이터")
+        st.markdown("저장된 분석의 **제목**과 **요약 내용**을 텍스트로 확인할 수 있습니다. 복사하여 GPT 등에 활용하세요.")
+        
+        # 기간 선택 (기본값 3일)
+        col_period, col_spacer = st.columns([1, 4])
+        with col_period:
+            raw_days_map = {"3일": 3, "7일": 7, "14일": 14, "28일": 28}
+            raw_selected_label = st.selectbox(
+                "📅 조회 기간",
+                options=list(raw_days_map.keys()),
+                index=0,
+                key="raw_days_selector"
+            )
+            raw_selected_days = raw_days_map[raw_selected_label]
+        
+        # DB에서 해당 기간 insights 조회
+        all_insights_raw = get_all_insights(user_id=user_id, include_analysis=True)
+        cutoff_raw = datetime.utcnow() - timedelta(days=raw_selected_days)
+        
+        filtered_insights = []
+        for ins in all_insights_raw:
+            created_at_str = ins['created_at']
+            try:
+                created_dt = datetime.strptime(created_at_str[:19], '%Y-%m-%d %H:%M:%S')
+            except Exception:
+                continue
+            if created_dt >= cutoff_raw:
+                filtered_insights.append(ins)
+        
+        if not filtered_insights:
+            st.info(f"📭 최근 {raw_selected_days}일 내 저장된 분석이 없습니다.")
+        else:
+            st.markdown(f"**총 {len(filtered_insights)}개의 분석 결과** (최근 {raw_selected_days}일)")
+            st.markdown("---")
+            
+            # 전체 텍스트를 하나로 합쳐서 복사 가능하게
+            full_text_parts = []
+            
+            for idx, ins in enumerate(filtered_insights):
+                title = ins['title'] if ins['title'] else f"영상 {ins['video_id'][:8]}..."
+                analysis = ins['analysis_result'] or ""
+                
+                # JSON 형태의 analysis_result에서 analysis 필드만 추출
+                display_text = analysis
+                raw_analysis = analysis.strip()
+                if raw_analysis.startswith('```'):
+                    raw_analysis = re.sub(r'^```(json)?\s*', '', raw_analysis)
+                if raw_analysis.endswith('```'):
+                    raw_analysis = re.sub(r'\s*```$', '', raw_analysis)
+                
+                if raw_analysis.startswith('{'):
+                    try:
+                        fixed = raw_analysis
+                        if not fixed.endswith('}'):
+                            if fixed.count('"') % 2 != 0:
+                                fixed += '"'
+                            fixed += '\n}'
+                        parsed = json.loads(fixed, strict=False)
+                        if isinstance(parsed, dict) and 'analysis' in parsed:
+                            display_text = parsed['analysis']
+                    except Exception:
+                        # 정규식으로 추출 시도
+                        analysis_match = re.search(r'"analysis"\s*:\s*"(.*)', raw_analysis, re.DOTALL)
+                        if analysis_match:
+                            display_text = analysis_match.group(1).strip()
+                            if display_text.endswith('```'):
+                                display_text = display_text[:-3].strip()
+                            if display_text.endswith('}'):
+                                display_text = display_text[:-1].strip()
+                            if display_text.endswith('"'):
+                                display_text = display_text[:-1].strip()
+                            display_text = display_text.replace('\\"', '"')
+                
+                # literal \n을 실제 줄바꿈으로 변환
+                if '\\n' in display_text:
+                    display_text = display_text.replace('\\n', '\n')
+                
+                # 개별 항목 표시
+                part = f"{'='*60}\n[{idx+1}] {title}\n{'='*60}\n\n{display_text}"
+                full_text_parts.append(part)
+            
+            # 전체 텍스트
+            full_text = "\n\n\n".join(full_text_parts)
+            
+            # 복사 버튼 (다운로드로 대체 - Streamlit은 클립보드 복사가 기본 제공 안 됨)
+            col_dl, col_info = st.columns([1, 4])
+            with col_dl:
+                st.download_button(
+                    label="📄 텍스트 다운로드",
+                    data=full_text,
+                    file_name=f"youtube_summaries_{raw_selected_days}days.txt",
+                    mime="text/plain",
+                    key="raw_download"
+                )
+            with col_info:
+                st.caption(f"💡 아래 텍스트를 직접 복사하거나, 다운로드 버튼을 사용하세요.")
+            
+            # 전체 텍스트를 text_area로 표시 (복사 편의)
+            st.text_area(
+                "요약 데이터 전체",
+                value=full_text,
+                height=600,
+                label_visibility="collapsed",
+                key="raw_text_area"
+            )
 
     elif selected_menu == "💬 RAG 챗봇":
         st.subheader("💬 내 지식베이스 챗봇 (RAG)")
