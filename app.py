@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timedelta
 from pathlib import Path
 import uuid
+import pandas as pd
+from io import StringIO
 import streamlit as st
 import streamlit.components.v1 as components
 import extra_streamlit_components as stx
@@ -184,6 +186,7 @@ def init_database():
             name TEXT NOT NULL,
             market TEXT DEFAULT 'KRX',
             user_id INTEGER REFERENCES users(id),
+            stock_type TEXT DEFAULT 'DAILY',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -192,11 +195,15 @@ def init_database():
         cursor.execute("ALTER TABLE stocks ADD COLUMN user_id INTEGER REFERENCES users(id)")
     except sqlite3.OperationalError:
         pass
+        
+    try:
+        cursor.execute("ALTER TABLE stocks ADD COLUMN stock_type TEXT DEFAULT 'DAILY'")
+    except sqlite3.OperationalError:
+        pass
     
-    # stocks UNIQUE 제약 변경: (symbol) -> (symbol, user_id) 조합으로 중복 방지
-    # SQLite는 ALTER로 제약 변경 불가하므로 인덱스로 대체
+    # 기존 인덱스는 남겨두거나 에러 무시, 새로운 인덱스 생성: (symbol, user_id, stock_type)
     cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_user_symbol ON stocks(symbol, user_id)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_user_symbol_type ON stocks(symbol, user_id, stock_type)
     """)
     
     # 일별 시세 테이블
@@ -230,6 +237,11 @@ def init_database():
         )
     """)
     
+    try:
+        cursor.execute("ALTER TABLE oauth_states ADD COLUMN credentials_json TEXT")
+    except sqlite3.OperationalError:
+        pass
+        
     # 영구 로그인용 세션 테이블
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
@@ -265,6 +277,25 @@ def init_database():
     
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_rag_chat_user ON rag_chat_history(user_id)
+    """)
+    
+    # 컨센서스 데이터 테이블
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS consensus_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id INTEGER NOT NULL,
+            year TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            value REAL,
+            is_estimate INTEGER DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (stock_id) REFERENCES stocks(id),
+            UNIQUE(stock_id, year, item_name)
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_consensus_stock ON consensus_data(stock_id)
     """)
     
     conn.commit()
@@ -595,23 +626,23 @@ def get_hidden_video_ids(user_id: int = None) -> set:
 # ============================================================
 # 주식 데이터 DB 함수
 # ============================================================
-def get_or_create_stock(symbol: str, name: str, user_id: int = None) -> int:
+def get_or_create_stock(symbol: str, name: str, user_id: int = None, stock_type: str = 'DAILY') -> int:
     """종목 코드로 stocks 테이블 조회/생성 후 ID 반환."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     if user_id is not None:
-        cursor.execute("SELECT id FROM stocks WHERE symbol = ? AND user_id = ?", (symbol, user_id))
+        cursor.execute("SELECT id FROM stocks WHERE symbol = ? AND user_id = ? AND stock_type = ?", (symbol, user_id, stock_type))
     else:
-        cursor.execute("SELECT id FROM stocks WHERE symbol = ? AND user_id IS NULL", (symbol,))
+        cursor.execute("SELECT id FROM stocks WHERE symbol = ? AND user_id IS NULL AND stock_type = ?", (symbol, stock_type))
     row = cursor.fetchone()
     
     if row:
         stock_id = row[0]
     else:
         cursor.execute(
-            "INSERT INTO stocks (symbol, name, user_id) VALUES (?, ?, ?)",
-            (symbol, name, user_id)
+            "INSERT INTO stocks (symbol, name, user_id, stock_type) VALUES (?, ?, ?, ?)",
+            (symbol, name, user_id, stock_type)
         )
         conn.commit()
         stock_id = cursor.lastrowid
@@ -637,7 +668,7 @@ def save_daily_prices_bulk(stock_id: int, records: list):
     return inserted
 
 
-def get_watched_stocks(user_id: int = None):
+def get_watched_stocks(user_id: int = None, stock_type: str = 'DAILY'):
     """등록된 관심 종목 목록을 조회합니다."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -650,10 +681,10 @@ def get_watched_stocks(user_id: int = None):
                    COUNT(dp.id) as data_count
             FROM stocks s
             LEFT JOIN daily_prices dp ON s.id = dp.stock_id
-            WHERE s.user_id = ?
+            WHERE s.user_id = ? AND s.stock_type = ?
             GROUP BY s.id
             ORDER BY s.created_at DESC
-        """, (user_id,))
+        """, (user_id, stock_type))
     else:
         cursor.execute("""
             SELECT s.id, s.symbol, s.name, s.market, s.created_at,
@@ -661,9 +692,10 @@ def get_watched_stocks(user_id: int = None):
                    COUNT(dp.id) as data_count
             FROM stocks s
             LEFT JOIN daily_prices dp ON s.id = dp.stock_id
+            WHERE s.stock_type = ?
             GROUP BY s.id
             ORDER BY s.created_at DESC
-        """)
+        """, (stock_type,))
     
     results = cursor.fetchall()
     conn.close()
@@ -694,11 +726,185 @@ def delete_stock(stock_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
+    cursor.execute("DELETE FROM consensus_data WHERE stock_id = ?", (stock_id,))
     cursor.execute("DELETE FROM daily_prices WHERE stock_id = ?", (stock_id,))
     cursor.execute("DELETE FROM stocks WHERE id = ?", (stock_id,))
     
     conn.commit()
     conn.close()
+
+
+# ============================================================
+# 컨센서스 데이터 수집/저장/조회 함수
+# ============================================================
+def fetch_consensus_data(symbol: str) -> dict | None:
+    """
+    네이버 금융(WiseReport)에서 컨센서스 영업이익(발표기준) 데이터를 수집합니다.
+    Returns: {'name': 종목명, 'records': [{'year': '2026', 'value': 123456, 'is_estimate': 1}, ...]}
+    """
+    import urllib3
+    urllib3.disable_warnings()
+    
+    _headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    }
+    
+    base = 'https://navercomp.wisereport.co.kr/v2/company'
+    
+    try:
+        session = requests.Session()
+        session.verify = False
+        session.headers.update(_headers)
+        
+        # 1. 메인 페이지에서 encparam, id 추출
+        page_url = f"{base}/c1010001.aspx?cmp_cd={symbol}"
+        resp = session.get(page_url, timeout=15)
+        text = resp.text
+        
+        enc_match = re.search(r"encparam\s*:\s*'([^']+)'", text)
+        id_match = re.search(r"id\s*:\s*'([^']+)'\s*\?", text)
+        
+        encparam = enc_match.group(1) if enc_match else ''
+        id_val = id_match.group(1) if id_match else ''
+        
+        if not encparam:
+            print(f"[CONSENSUS] encparam 추출 실패: {symbol}")
+            return None
+        
+        # 2. AJAX 호출 - 연간 재무 데이터
+        ajax_url = f"{base}/ajax/cF1001.aspx"
+        params = {
+            'cmp_cd': symbol,
+            'fin_typ': '0',
+            'freq_typ': 'Y',
+            'extY': '3',
+            'extQ': '0',
+            'encparam': encparam,
+            'id': id_val,
+        }
+        
+        ajax_resp = session.get(ajax_url, params=params, headers={
+            'Referer': page_url,
+            'X-Requested-With': 'XMLHttpRequest',
+        }, timeout=15)
+        
+        if len(ajax_resp.text.strip()) < 10:
+            print(f"[CONSENSUS] AJAX 빈 응답: {symbol}")
+            return None
+        
+        # 3. pandas로 파싱
+        dfs = pd.read_html(StringIO(ajax_resp.text), encoding='utf-8')
+        
+        if len(dfs) < 2:
+            print(f"[CONSENSUS] 테이블 부족: {symbol}")
+            return None
+        
+        df = dfs[1]  # 두번째 테이블이 재무데이터
+        
+        # 종목명 추출 (title 태그에서)
+        name_match = re.search(r'<title>\s*(.+?)\s*:\s*(?:Npay|네이버)', resp.text)
+        stock_name = name_match.group(1).strip() if name_match else symbol
+        
+        # 영업이익(발표기준) 행 (인덱스 2)
+        row = df.iloc[2]
+        
+        # 컬럼에서 연도 추출 및 데이터 매핑
+        records = []
+        for col_idx in range(1, len(df.columns)):
+            col_name = str(df.columns[col_idx])
+            # 연도 추출 (예: "2026/12(E)" 또는 "('매출액', '2026/12(E)  (IFRS연)')")
+            year_match = re.search(r'(\d{4})/\d{2}', col_name)
+            if not year_match:
+                continue
+            
+            year = year_match.group(1)
+            is_estimate = 1 if '(E)' in col_name else 0
+            value = row.iloc[col_idx]
+            
+            # NaN 체크
+            if pd.isna(value):
+                continue
+            
+            # 26~28년만 필터
+            if year in ('2026', '2027', '2028'):
+                records.append({
+                    'year': year,
+                    'value': float(value),
+                    'is_estimate': is_estimate,
+                })
+        
+        print(f"[CONSENSUS] {stock_name}({symbol}): {len(records)}건 수집")
+        return {'name': stock_name, 'records': records}
+    
+    except Exception as e:
+        print(f"[CONSENSUS ERROR] {symbol}: {e}")
+        return None
+
+
+def save_consensus_data(stock_id: int, records: list):
+    """컨센서스 데이터를 DB에 저장합니다 (UPSERT)."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    for r in records:
+        cursor.execute("""
+            INSERT INTO consensus_data (stock_id, year, item_name, value, is_estimate, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(stock_id, year, item_name)
+            DO UPDATE SET value = excluded.value, is_estimate = excluded.is_estimate, updated_at = CURRENT_TIMESTAMP
+        """, (stock_id, r['year'], '영업이익(발표기준)', r['value'], r['is_estimate']))
+    
+    conn.commit()
+    conn.close()
+    return len(records)
+
+
+def get_consensus_data(stock_id: int) -> list:
+    """특정 종목의 컨센서스 데이터를 조회합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT year, item_name, value, is_estimate, updated_at
+        FROM consensus_data
+        WHERE stock_id = ?
+        ORDER BY year ASC
+    """, (stock_id,))
+    
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def get_all_consensus_summary(user_id: int) -> list:
+    """
+    사용자의 전체 관심종목 컨센서스 영업이익 요약을 조회합니다.
+    Returns: [{'stock_id', 'symbol', 'name', 'y2026', 'y2027', 'y2028', 'updated_at'}, ...]
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT 
+            s.id as stock_id,
+            s.symbol,
+            s.name,
+            MAX(CASE WHEN cd.year = '2026' THEN cd.value END) as y2026,
+            MAX(CASE WHEN cd.year = '2027' THEN cd.value END) as y2027,
+            MAX(CASE WHEN cd.year = '2028' THEN cd.value END) as y2028,
+            MAX(cd.updated_at) as updated_at
+        FROM stocks s
+        LEFT JOIN consensus_data cd ON s.id = cd.stock_id AND cd.item_name = '영업이익(발표기준)'
+        WHERE s.user_id = ?
+        GROUP BY s.id
+        ORDER BY s.name ASC
+    """, (user_id,))
+    
+    results = cursor.fetchall()
+    conn.close()
+    return results
 
 
 # ============================================================
@@ -718,6 +924,7 @@ def load_krx_stock_list() -> list[dict]:
         headers = {'User-Agent': 'Mozilla/5.0'}
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
+        resp.encoding = 'EUC-KR'  # 한글 깨짐 방지
         
         text = resp.text
         trs = re.findall(r'<tr[^>]*>(.*?)</tr>', text, re.DOTALL)
@@ -2216,7 +2423,7 @@ def main():
     
     # 기존 탭(st.tabs)과 유사한 디자인을 유지하면서 최적화(Lazy Loading)를 달성하기 위해 가로형 라디오 버튼 사용
     if is_logged_in:
-        menus = ["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터", "📰 내 신문", "📋 요약 데이터", "💬 RAG 챗봇"]
+        menus = ["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터", "📊 컨센서스 분석", "📰 내 신문", "📋 요약 데이터", "💬 RAG 챗봇"]
     else:
         menus = ["🔗 URL 분석"]
         
@@ -2451,7 +2658,7 @@ def main():
                 for r in results:
                     col_info, col_add = st.columns([4, 1])
                     with col_info:
-                        market_badge = "🟦 코스피" if r['market'] == "유가증권시장" else "🟩 코스닥"
+                        market_badge = "🟦 코스피" if "유가증권" in r['market'] else "🟩 코스닥"
                         st.markdown(f"**{r['name']}** ({r['symbol']}) {market_badge}")
                     with col_add:
                         if st.button("➕", key=f"add_{r['symbol']}", use_container_width=True):
@@ -2589,6 +2796,199 @@ def main():
         else:
             st.info("📭 종목을 먼저 추가해주세요.")
             
+    elif selected_menu == "📊 컨센서스 분석":
+        st.markdown("---")
+        st.header("📊 컨센서스 영업이익 분석")
+        st.markdown("관심 종목의 영업이익 컨센서스를 한눈에 비교합니다.")
+        
+        # 종목 추가 섹션 (컨센서스 전용)
+        st.subheader("🔍 종목 추가 (컨센서스용)")
+        query = st.text_input("종목명 또는 종목코드 6자리 입력", placeholder="예: 삼성전자, 005930", key="consensus_search_input")
+        
+        if query:
+            if re.match(r'^\d{6}$', query):
+                col_direct, col_btn = st.columns([4, 1])
+                with col_direct:
+                    st.info(f"🔢 종목코드 직접 입력: **{query}**")
+                with col_btn:
+                    if st.button("➕ 추가", key="add_consensus_direct", use_container_width=True):
+                        with st.spinner(f"🔍 {query} 종목 정보 확인 중..."):
+                            name = fetch_naver_stock_name(query)
+                            if name:
+                                get_or_create_stock(query, name, user_id=user_id, stock_type='CONSENSUS')
+                                st.success(f"✅ {name} ({query}) 등록 완료!")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ 종목코드 {query}을 찾을 수 없습니다.")
+            
+            # 종목명 검색
+            results = search_stocks(query)
+            if results:
+                for r in results:
+                    col_info, col_add = st.columns([4, 1])
+                    with col_info:
+                        market_badge = "🟦 코스피" if "유가증권" in r['market'] else "🟩 코스닥"
+                        st.markdown(f"**{r['name']}** ({r['symbol']}) {market_badge}")
+                    with col_add:
+                        if st.button("➕", key=f"add_consensus_{r['symbol']}", use_container_width=True):
+                            get_or_create_stock(r['symbol'], r['name'], user_id=user_id, stock_type='CONSENSUS')
+                            st.success(f"✅ {r['name']} ({r['symbol']}) 등록 완료!")
+                            st.rerun()
+            elif not re.match(r'^\d{6}$', query):
+                st.caption("🔍 검색 결과가 없습니다.")
+        
+        st.markdown("---")
+        
+        st.subheader("📋 컨센서스 관심 종목")
+        st.caption("네이버 금융 WiseReport 기반 · 단위: 억원 · (E) = 추정치")
+        
+        watched_for_consensus = get_watched_stocks(user_id=user_id, stock_type='CONSENSUS')
+        
+        if not watched_for_consensus:
+            st.info("📭 관심 종목을 등록하면 데이터를 수집할 수 있습니다.")
+        else:
+            col_fetch_all, col_spacer = st.columns([1, 3])
+            with col_fetch_all:
+                fetch_consensus_btn = st.button(
+                    "📥 전체 수집 및 갱신",
+                    key="fetch_all_consensus",
+                    help="등록된 모든 종목의 컨센서스 데이터를 가져옵니다",
+                    use_container_width=True
+                )
+            
+            if fetch_consensus_btn:
+                import time as _time
+                progress = st.progress(0, text="데이터 수집 준비 중...")
+                success_cnt = 0
+                fail_cnt = 0
+                
+                for idx, stock in enumerate(watched_for_consensus):
+                    progress.progress(
+                        idx / len(watched_for_consensus),
+                        text=f"📥 {stock['name']} ({idx+1}/{len(watched_for_consensus)}) 수집 중..."
+                    )
+                    try:
+                        result = fetch_consensus_data(stock['symbol'])
+                        if result and result['records']:
+                            save_consensus_data(stock['id'], result['records'])
+                            success_cnt += 1
+                        else:
+                            fail_cnt += 1
+                    except Exception:
+                        fail_cnt += 1
+                    _time.sleep(1)
+                
+                progress.progress(1.0, text="✅ 수집 완료!")
+                msg = f"✅ 수집 완료: 성공 {success_cnt}개"
+                if fail_cnt > 0:
+                    msg += f", 실패 {fail_cnt}개"
+                st.toast(msg, icon="📊")
+                st.rerun()
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            # 종목 삭제 등 개별 관리 UI
+            with st.expander("⚙️ 관심 종목 관리 (삭제)"):
+                for stock in watched_for_consensus:
+                    col_name, col_del = st.columns([4, 1])
+                    with col_name:
+                        st.write(f"**{stock['name']}** ({stock['symbol']})")
+                    with col_del:
+                        if st.button("🗑️ 삭제", key=f"del_consensus_{stock['id']}", help="종목 삭제"):
+                            delete_stock(stock['id'])
+                            st.toast(f"🗑️ {stock['name']} 삭제 완료", icon="🗑️")
+                            st.rerun()
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            # 데이터 요약
+            summary = get_all_consensus_summary(user_id=user_id)
+            # 현재 탭(CONSENSUS)에 있는 종목 id만 필터링
+            consensus_stock_ids = [s['id'] for s in watched_for_consensus]
+            filtered_summary = [row for row in summary if row['stock_id'] in consensus_stock_ids]
+            
+            has_data = any(row['y2026'] is not None for row in filtered_summary)
+            
+            if has_data:
+                def fmt_val(v):
+                    """억원 값을 읽기 쉬운 형태로 포맷"""
+                    if v is None:
+                        return "-"
+                    v = float(v)
+                    if abs(v) >= 10000:
+                        return f"{v/10000:,.1f}조"
+                    else:
+                        return f"{v:,.0f}억"
+                
+                def calc_yoy(cur, prev):
+                    """YoY 성장률 계산"""
+                    if cur is None or prev is None or prev == 0:
+                        return "-"
+                    rate = (float(cur) - float(prev)) / abs(float(prev)) * 100
+                    sign = "+" if rate > 0 else ""
+                    return f"{sign}{rate:.1f}%"
+                
+                # 정렬 옵션
+                sort_options = {
+                    "종목명순": "name",
+                    "26년 영업이익 높은순": "y2026_desc",
+                    "27년 YoY 성장률 높은순": "yoy27_desc",
+                }
+                sort_key = st.selectbox(
+                    "정렬 기준",
+                    options=list(sort_options.keys()),
+                    key="consensus_sort"
+                )
+                
+                # 정렬 적용
+                summary_list = [dict(row) for row in filtered_summary if row['y2026'] is not None]
+                
+                if sort_options[sort_key] == "y2026_desc":
+                    summary_list.sort(key=lambda x: x['y2026'] or 0, reverse=True)
+                elif sort_options[sort_key] == "yoy27_desc":
+                    def _yoy_sort(x):
+                        if x['y2027'] and x['y2026'] and x['y2026'] != 0:
+                            return (x['y2027'] - x['y2026']) / abs(x['y2026'])
+                        return -999
+                    summary_list.sort(key=_yoy_sort, reverse=True)
+                else:
+                    summary_list.sort(key=lambda x: x['name'])
+                
+                table_rows = []
+                for row in summary_list:
+                    table_rows.append({
+                        "종목": f"{row['name']} ({row['symbol']})",
+                        "26년(E)": fmt_val(row['y2026']),
+                        "27년(E)": fmt_val(row['y2027']),
+                        "28년(E)": fmt_val(row['y2028']),
+                        "YoY 26→27": calc_yoy(row['y2027'], row['y2026']),
+                        "YoY 27→28": calc_yoy(row['y2028'], row['y2027']),
+                        "수집일": row['updated_at'][:10] if row['updated_at'] else "-",
+                    })
+                
+                st.dataframe(table_rows, use_container_width=True, hide_index=True)
+                
+                # CSV 다운로드
+                csv_header = "종목코드,종목명,26년(E),27년(E),28년(E),YoY_26_27,YoY_27_28"
+                csv_body = []
+                for row in summary_list:
+                    yoy27 = calc_yoy(row['y2027'], row['y2026'])
+                    yoy28 = calc_yoy(row['y2028'], row['y2027'])
+                    csv_body.append(
+                        f"{row['symbol']},{row['name']},{row['y2026'] or ''},{row['y2027'] or ''},{row['y2028'] or ''},{yoy27},{yoy28}"
+                    )
+                consensus_csv = csv_header + "\n" + "\n".join(csv_body)
+                
+                st.download_button(
+                    label="📄 컨센서스 CSV 다운로드",
+                    data=consensus_csv,
+                    file_name="consensus_operating_profit.csv",
+                    mime="text/csv",
+                    key="consensus_csv_download"
+                )
+            else:
+                st.info("📭 수집된 데이터가 없습니다. 위의 **📥 전체 수집 및 갱신** 버튼을 눌러주세요.")
+
     elif selected_menu == "📰 내 신문":
             st.markdown("---")
             st.header("📰 나만의 인터넷 신문 발행소")
