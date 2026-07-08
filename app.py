@@ -756,6 +756,21 @@ def fetch_consensus_data(symbol: str) -> dict | None:
         session.verify = False
         session.headers.update(_headers)
         
+        # 프록시 설정 (웹쉐어)
+        try:
+            if CONFIG_PATH.exists():
+                with open(CONFIG_PATH, 'r') as f:
+                    config = json.load(f)
+                proxy_cfg = config.get('WEBSHARE_PROXY', {})
+                if proxy_cfg.get('enabled') and proxy_cfg.get('username') and proxy_cfg.get('password'):
+                    proxy_url = f"http://{proxy_cfg['username']}:{proxy_cfg['password']}@p.webshare.io:80"
+                    session.proxies.update({
+                        'http': proxy_url,
+                        'https': proxy_url
+                    })
+        except Exception as e:
+            print(f"[CONSENSUS] 프록시 설정 로드 실패: {e}")
+            
         # 1. 메인 페이지에서 encparam, id 추출
         page_url = f"{base}/c1010001.aspx?cmp_cd={symbol}"
         resp = session.get(page_url, timeout=15)
