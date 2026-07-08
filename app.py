@@ -626,23 +626,27 @@ def get_hidden_video_ids(user_id: int = None) -> set:
 # ============================================================
 # 주식 데이터 DB 함수
 # ============================================================
-def get_or_create_stock(symbol: str, name: str, user_id: int = None, stock_type: str = 'DAILY') -> int:
+def get_or_create_stock(symbol: str, name: str, user_id: int = None, stock_type: str = 'DAILY', group_id: int = None) -> int:
     """종목 코드로 stocks 테이블 조회/생성 후 ID 반환."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     if user_id is not None:
-        cursor.execute("SELECT id FROM stocks WHERE symbol = ? AND user_id = ? AND stock_type = ?", (symbol, user_id, stock_type))
+        cursor.execute("SELECT id, group_id FROM stocks WHERE symbol = ? AND user_id = ? AND stock_type = ?", (symbol, user_id, stock_type))
     else:
-        cursor.execute("SELECT id FROM stocks WHERE symbol = ? AND user_id IS NULL AND stock_type = ?", (symbol, stock_type))
+        cursor.execute("SELECT id, group_id FROM stocks WHERE symbol = ? AND user_id IS NULL AND stock_type = ?", (symbol, stock_type))
     row = cursor.fetchone()
     
     if row:
         stock_id = row[0]
+        # 만약 기존에 등록된 종목인데 미지정 그룹(None)이고, 새롭게 특정 그룹으로 지정하려고 할 때 업데이트 해줍니다.
+        if row[1] is None and group_id is not None:
+            cursor.execute("UPDATE stocks SET group_id = ? WHERE id = ?", (group_id, stock_id))
+            conn.commit()
     else:
         cursor.execute(
-            "INSERT INTO stocks (symbol, name, user_id, stock_type) VALUES (?, ?, ?, ?)",
-            (symbol, name, user_id, stock_type)
+            "INSERT INTO stocks (symbol, name, user_id, stock_type, group_id) VALUES (?, ?, ?, ?, ?)",
+            (symbol, name, user_id, stock_type, group_id)
         )
         conn.commit()
         stock_id = cursor.lastrowid
@@ -669,37 +673,77 @@ def save_daily_prices_bulk(stock_id: int, records: list):
 
 
 def get_watched_stocks(user_id: int = None, stock_type: str = 'DAILY'):
-    """등록된 관심 종목 목록을 조회합니다."""
+    """등록된 관심 종목 목록을 그룹 정보와 함께 조회합니다."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
     if user_id is not None:
         cursor.execute("""
-            SELECT s.id, s.symbol, s.name, s.market, s.created_at,
+            SELECT s.id, s.symbol, s.name, s.market, s.created_at, s.group_id,
+                   g.name as group_name,
                    MAX(dp.date) as last_date,
                    COUNT(dp.id) as data_count
             FROM stocks s
+            LEFT JOIN stock_groups g ON s.group_id = g.id
             LEFT JOIN daily_prices dp ON s.id = dp.stock_id
             WHERE s.user_id = ? AND s.stock_type = ?
             GROUP BY s.id
-            ORDER BY s.created_at DESC
+            ORDER BY g.name ASC, s.created_at DESC
         """, (user_id, stock_type))
     else:
         cursor.execute("""
-            SELECT s.id, s.symbol, s.name, s.market, s.created_at,
+            SELECT s.id, s.symbol, s.name, s.market, s.created_at, s.group_id,
+                   g.name as group_name,
                    MAX(dp.date) as last_date,
                    COUNT(dp.id) as data_count
             FROM stocks s
+            LEFT JOIN stock_groups g ON s.group_id = g.id
             LEFT JOIN daily_prices dp ON s.id = dp.stock_id
             WHERE s.stock_type = ?
             GROUP BY s.id
-            ORDER BY s.created_at DESC
+            ORDER BY g.name ASC, s.created_at DESC
         """, (stock_type,))
     
     results = cursor.fetchall()
     conn.close()
     return results
+
+
+def get_groups(user_id: int, group_type: str):
+    """사용자의 관심 종목 그룹 목록을 조회합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, name FROM stock_groups WHERE user_id = ? AND group_type = ? ORDER BY created_at ASC",
+        (user_id, group_type)
+    )
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+def create_group(user_id: int, name: str, group_type: str):
+    """새로운 관심 종목 그룹을 생성합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO stock_groups (user_id, name, group_type) VALUES (?, ?, ?)",
+        (user_id, name, group_type)
+    )
+    conn.commit()
+    group_id = cursor.lastrowid
+    conn.close()
+    return group_id
+
+def delete_group(group_id: int):
+    """그룹을 삭제하고, 해당 그룹에 속한 종목들을 미지정 상태로 변경합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE stocks SET group_id = NULL WHERE group_id = ?", (group_id,))
+    cursor.execute("DELETE FROM stock_groups WHERE id = ?", (group_id,))
+    conn.commit()
+    conn.close()
 
 
 def get_daily_prices(stock_id: int, limit: int = 60):
@@ -720,6 +764,52 @@ def get_daily_prices(stock_id: int, limit: int = 60):
     conn.close()
     return results
 
+
+
+def render_group_management(user_id: int, stock_type: str, prefix: str):
+    import streamlit as st
+    groups = get_groups(user_id, stock_type)
+    
+    with st.expander("📂 그룹 관리 (추가/삭제)"):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            new_group_name = st.text_input("새 그룹 이름", key=f"new_group_{prefix}", label_visibility="collapsed", placeholder="새 그룹 이름")
+        with col2:
+            if st.button("추가", key=f"add_group_{prefix}", use_container_width=True):
+                if new_group_name:
+                    create_group(user_id, new_group_name, stock_type)
+                    st.success("그룹 생성 완료")
+                    st.rerun()
+                    
+        if groups:
+            st.markdown("---")
+            for g in groups:
+                col_n, col_d = st.columns([4, 1])
+                col_n.markdown(f"**{g['name']}**")
+                if col_d.button("삭제", key=f"del_group_{prefix}_{g['id']}", use_container_width=True):
+                    delete_group(g['id'])
+                    st.warning("그룹 삭제 완료")
+                    st.rerun()
+    return groups
+
+def render_watched_stocks_grouped(watched_list, render_item_func, prefix):
+    import streamlit as st
+    if not watched_list:
+        st.info("📭 관심 종목을 등록해주세요.")
+        return
+        
+    # 그룹별 분류
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for s in watched_list:
+        gname = s['group_name'] if s['group_name'] else "미지정"
+        grouped[gname].append(s)
+        
+    for gname, stocks in grouped.items():
+        with st.expander(f"📁 {gname} ({len(stocks)}종목)", expanded=True):
+            for stock in stocks:
+                render_item_func(stock)
+                st.markdown("---")
 
 def delete_stock(stock_id: int):
     """종목과 관련 시세 데이터를 삭제합니다."""
@@ -2640,7 +2730,15 @@ def main():
         # 종목 추가 영역
         st.subheader("➕ 종목 추가")
         
+        daily_groups = render_group_management(user_id, 'DAILY', 'daily')
+        
+        group_options = {"미지정 (기본)": None}
+        for g in daily_groups: group_options[g['name']] = g['id']
+        selected_daily_group_name = st.selectbox("추가할 그룹 선택", list(group_options.keys()), key="sel_g_daily")
+        sel_g_daily_id = group_options[selected_daily_group_name]
+        
         search_query = st.text_input(
+
             "종목 검색",
             placeholder="종목명 또는 종목코드 입력 (예: 삼성전자, 005930)",
             label_visibility="collapsed",
@@ -2660,7 +2758,7 @@ def main():
                         with st.spinner(f"🔍 {query} 종목 정보 확인 중..."):
                             name = fetch_naver_stock_name(query)
                             if name:
-                                get_or_create_stock(query, name, user_id=user_id)
+                                get_or_create_stock(query, name, user_id=user_id, group_id=sel_g_daily_id)
                                 st.success(f"✅ {name} ({query}) 등록 완료!")
                                 st.rerun()
                             else:
@@ -2677,7 +2775,7 @@ def main():
                         st.markdown(f"**{r['name']}** ({r['symbol']}) {market_badge}")
                     with col_add:
                         if st.button("➕", key=f"add_{r['symbol']}", use_container_width=True):
-                            get_or_create_stock(r['symbol'], r['name'], user_id=user_id)
+                            get_or_create_stock(r['symbol'], r['name'], user_id=user_id, group_id=sel_g_daily_id)
                             st.success(f"✅ {r['name']} ({r['symbol']}) 등록 완료!")
                             st.rerun()
             elif not re.match(r'^\d{6}$', query):
@@ -2724,9 +2822,9 @@ def main():
                 st.toast(result_msg, icon="📈")
                 st.rerun()
             
-            for stock in watched:
+            
+            def render_daily_stock(stock):
                 col_name, col_info, col_fetch, col_del = st.columns([3, 2, 1, 1])
-                
                 with col_name:
                     st.markdown(f"**{stock['name']}** (`{stock['symbol']}`)")
                 with col_info:
@@ -2748,7 +2846,8 @@ def main():
                         delete_stock(stock['id'])
                         st.toast(f"🗑️ {stock['name']} 삭제 완료", icon="🗑️")
                         st.rerun()
-        
+            
+            render_watched_stocks_grouped(watched, render_daily_stock, 'daily_list')
         st.markdown("---")
         
         # 데이터 조회 영역
@@ -2818,7 +2917,16 @@ def main():
         
         # 종목 추가 섹션 (컨센서스 전용)
         st.subheader("🔍 종목 추가 (컨센서스용)")
+        
+        cons_groups = render_group_management(user_id, 'CONSENSUS', 'cons')
+        
+        c_group_options = {"미지정 (기본)": None}
+        for g in cons_groups: c_group_options[g['name']] = g['id']
+        selected_cons_group_name = st.selectbox("추가할 그룹 선택", list(c_group_options.keys()), key="sel_g_cons")
+        sel_g_cons_id = c_group_options[selected_cons_group_name]
+        
         query = st.text_input("종목명 또는 종목코드 6자리 입력", placeholder="예: 삼성전자, 005930", key="consensus_search_input")
+
         
         if query:
             if re.match(r'^\d{6}$', query):
@@ -2830,7 +2938,7 @@ def main():
                         with st.spinner(f"🔍 {query} 종목 정보 확인 중..."):
                             name = fetch_naver_stock_name(query)
                             if name:
-                                get_or_create_stock(query, name, user_id=user_id, stock_type='CONSENSUS')
+                                get_or_create_stock(query, name, user_id=user_id, stock_type='CONSENSUS', group_id=sel_g_cons_id)
                                 st.success(f"✅ {name} ({query}) 등록 완료!")
                                 st.rerun()
                             else:
@@ -2846,7 +2954,7 @@ def main():
                         st.markdown(f"**{r['name']}** ({r['symbol']}) {market_badge}")
                     with col_add:
                         if st.button("➕", key=f"add_consensus_{r['symbol']}", use_container_width=True):
-                            get_or_create_stock(r['symbol'], r['name'], user_id=user_id, stock_type='CONSENSUS')
+                            get_or_create_stock(r['symbol'], r['name'], user_id=user_id, stock_type='CONSENSUS', group_id=sel_g_cons_id)
                             st.success(f"✅ {r['name']} ({r['symbol']}) 등록 완료!")
                             st.rerun()
             elif not re.match(r'^\d{6}$', query):
