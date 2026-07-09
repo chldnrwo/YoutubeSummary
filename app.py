@@ -3132,9 +3132,7 @@ def main():
                     st.dataframe(table_rows, use_container_width=True, hide_index=True)
                     st.markdown("<br>", unsafe_allow_html=True)
                 
-                consensus_csv = csv_header + "
-" + "
-".join(csv_body)
+                consensus_csv = csv_header + "\\n" + "\\n".join(csv_body)
                 st.download_button(
                     label="📄 컨센서스 전체 CSV 다운로드",
                     data=consensus_csv,
