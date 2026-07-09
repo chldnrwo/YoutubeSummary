@@ -639,8 +639,8 @@ def get_or_create_stock(symbol: str, name: str, user_id: int = None, stock_type:
     
     if row:
         stock_id = row[0]
-        # 만약 기존에 등록된 종목인데 미지정 그룹(None)이고, 새롭게 특정 그룹으로 지정하려고 할 때 업데이트 해줍니다.
-        if row[1] is None and group_id is not None:
+        # 이미 등록된 종목이라도, 사용자가 선택한 그룹으로 업데이트하여 폴더 이동을 지원합니다.
+        if row[1] != group_id:
             cursor.execute("UPDATE stocks SET group_id = ? WHERE id = ?", (group_id, stock_id))
             conn.commit()
     else:
