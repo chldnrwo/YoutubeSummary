@@ -3358,6 +3358,9 @@ def main():
             # 전체 텍스트
             full_text = "\n\n\n".join(full_text_parts)
             
+            # 필터 상태를 key에 반영하여 캐시 무효화
+            filter_key = f"{raw_selected_days}_{'_'.join(sorted(selected_channels)) if selected_channels else 'all'}"
+            
             # 복사 버튼 (다운로드로 대체 - Streamlit은 클립보드 복사가 기본 제공 안 됨)
             col_dl, col_info = st.columns([1, 4])
             with col_dl:
@@ -3366,7 +3369,7 @@ def main():
                     data=full_text,
                     file_name=f"youtube_summaries_{raw_selected_days}days.txt",
                     mime="text/plain",
-                    key="raw_download"
+                    key=f"raw_download_{filter_key}"
                 )
             with col_info:
                 st.caption(f"💡 아래 텍스트를 직접 복사하거나, 다운로드 버튼을 사용하세요.")
@@ -3377,7 +3380,7 @@ def main():
                 value=full_text,
                 height=600,
                 label_visibility="collapsed",
-                key="raw_text_area"
+                key=f"raw_text_area_{filter_key}"
             )
 
     elif selected_menu == "💬 RAG 챗봇":
