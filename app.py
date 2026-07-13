@@ -173,6 +173,11 @@ def init_database():
         cursor.execute("ALTER TABLE insights ADD COLUMN category TEXT DEFAULT '그 외'")
     except sqlite3.OperationalError:
         pass
+
+    try:
+        cursor.execute("ALTER TABLE insights ADD COLUMN channel_title TEXT")
+    except sqlite3.OperationalError:
+        pass
     
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_video_id ON insights(video_id)
@@ -433,15 +438,15 @@ def get_current_user_info(youtube) -> dict | None:
         return None
 
 
-def save_insight(video_id: str, video_url: str, title: str, transcript: str, analysis_result: str, user_id: int = None, published_at: str = None, category: str = '그 외'):
+def save_insight(video_id: str, video_url: str, title: str, transcript: str, analysis_result: str, user_id: int = None, published_at: str = None, category: str = '그 외', channel_title: str = None):
     """분석 결과를 데이터베이스에 저장합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute("""
-        INSERT INTO insights (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category))
+        INSERT INTO insights (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category, channel_title)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category, channel_title))
     db_id = cursor.lastrowid
     
     conn.commit()
@@ -488,7 +493,7 @@ def get_all_insights(user_id: int = None, include_analysis: bool = False):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    columns = "id, video_id, video_url, title, analysis_result, created_at, published_at, category" if include_analysis else "id, video_id, video_url, title, created_at, published_at, category"
+    columns = "id, video_id, video_url, title, analysis_result, created_at, published_at, category, channel_title" if include_analysis else "id, video_id, video_url, title, created_at, published_at, category, channel_title"
     
     if user_id is not None:
         cursor.execute(f"""
@@ -1769,16 +1774,16 @@ def generate_newspaper_section(category: str, insights_text: str, api_key: str) 
         return f"🚨 기사 작성 중 오류가 발생했습니다: {e}"
 
 
-def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None) -> tuple[str, str, str]:
+def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None) -> tuple[str, str, str]:
     """영상을 분석하고 결과를 반환합니다."""
     transcript = get_transcript(video_id)
     title, category, analysis = analyze_with_gemini(transcript, api_key, force_model=force_model)
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at, category=category)
+    save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at, category=category, channel_title=channel_title)
     return title, category, analysis
 
 
-def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None):
+def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None):
     """영상 분석을 ThreadPoolExecutor에 제출합니다."""
     with _analysis_lock:
         # 이미 진행 중이거나 완료된 경우 스킵
@@ -1790,7 +1795,7 @@ def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_
         try:
             with _analysis_lock:
                 _analysis_status[video_id] = 'running'
-            analyze_video(video_id, api_key, user_id=user_id, published_at=published_at, force_model=force_model)
+            analyze_video(video_id, api_key, user_id=user_id, published_at=published_at, force_model=force_model, channel_title=channel_title)
             with _analysis_lock:
                 _analysis_status[video_id] = 'done'
         except Exception as e:
@@ -1880,7 +1885,7 @@ def render_video_card(video: dict, user_id: int):
             def on_retry():
                 with _analysis_lock:
                     _analysis_status.pop(vid, None)
-                submit_analysis(vid, st.session_state.get('api_key', ''), user_id=user_id)
+                submit_analysis(vid, st.session_state.get('api_key', ''), user_id=user_id, channel_title=video.get('channel_title'))
                 st.toast(f"📝 '{title[:20]}...' 재시도!", icon="🔄")
             st.button("🔄 재시도 (실패)", key=f"retry_{vid}", on_click=on_retry, use_container_width=True)
         with btn_col2:
@@ -1894,7 +1899,7 @@ def render_video_card(video: dict, user_id: int):
                     st.toast("❌ API Key를 먼저 입력하세요.", icon="⚠️")
                     return
                 # published_at 값을 전달하여 DB 저장 시 업로드 시간 기록
-                submit_analysis(vid, api_key, user_id=user_id, published_at=video.get('published_at'))
+                submit_analysis(vid, api_key, user_id=user_id, published_at=video.get('published_at'), channel_title=video.get('channel_title'))
                 st.toast(f"📝 '{title[:20]}...' 분석 대기열 추가!", icon="🚀")
             st.button("🔍 분석", key=f"analyze_{vid}", on_click=on_analyze, use_container_width=True)
         with btn_col2:
@@ -2596,9 +2601,21 @@ def main():
                         force_model=force_model_val
                     )
                 
+                # oEmbed API로 채널명 가져오기
+                url_channel_title = None
+                try:
+                    oembed_resp = requests.get(
+                        f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json",
+                        timeout=5
+                    )
+                    if oembed_resp.status_code == 200:
+                        url_channel_title = oembed_resp.json().get('author_name')
+                except Exception:
+                    pass
+                
                 # 로그인 상태에서만 DB에 저장
                 if is_logged_in and user_id:
-                    db_id = save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=None, category=category)
+                    db_id = save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=None, category=category, channel_title=url_channel_title)
                     if db_id:
                         try:
                             mark_insight_as_read(user_id, db_id)
@@ -3224,10 +3241,10 @@ def main():
     elif selected_menu == "📋 요약 데이터":
         st.markdown("---")
         st.header("📋 유튜브 요약 Raw 데이터")
-        st.markdown("저장된 분석의 **제목**과 **요약 내용**을 텍스트로 확인할 수 있습니다. 복사하여 GPT 등에 활용하세요.")
+        st.markdown("저장된 분석의 **제목**, **채널**, **업로드 날짜**, **요약 내용**을 텍스트로 확인할 수 있습니다. 복사하여 GPT 등에 활용하세요.")
         
-        # 기간 선택 (기본값 3일)
-        col_period, col_spacer = st.columns([1, 4])
+        # 기간 선택 + 채널 필터
+        col_period, col_channel = st.columns([1, 2])
         with col_period:
             raw_days_map = {"3일": 3, "7일": 7, "14일": 14, "28일": 28}
             raw_selected_label = st.selectbox(
@@ -3252,10 +3269,36 @@ def main():
             if created_dt >= cutoff_raw:
                 filtered_insights.append(ins)
         
+        # 채널 목록 추출 및 필터 UI
+        channel_set = set()
+        for ins in filtered_insights:
+            ch = ins['channel_title']
+            if ch:
+                channel_set.add(ch)
+        channel_list = sorted(channel_set)
+        
+        with col_channel:
+            if channel_list:
+                selected_channels = st.multiselect(
+                    "📺 채널 필터",
+                    options=channel_list,
+                    default=[],
+                    key="raw_channel_filter",
+                    placeholder="전체 채널 (필터 없음)"
+                )
+            else:
+                selected_channels = []
+                st.caption("📺 채널 정보가 없습니다.")
+        
+        # 채널 필터 적용
+        if selected_channels:
+            filtered_insights = [ins for ins in filtered_insights if ins['channel_title'] in selected_channels]
+        
         if not filtered_insights:
             st.info(f"📭 최근 {raw_selected_days}일 내 저장된 분석이 없습니다.")
         else:
-            st.markdown(f"**총 {len(filtered_insights)}개의 분석 결과** (최근 {raw_selected_days}일)")
+            channel_info = f" | 채널: {', '.join(selected_channels)}" if selected_channels else ""
+            st.markdown(f"**총 {len(filtered_insights)}개의 분석 결과** (최근 {raw_selected_days}일{channel_info})")
             st.markdown("---")
             
             # 전체 텍스트를 하나로 합쳐서 복사 가능하게
@@ -3264,6 +3307,14 @@ def main():
             for idx, ins in enumerate(filtered_insights):
                 title = ins['title'] if ins['title'] else f"영상 {ins['video_id'][:8]}..."
                 analysis = ins['analysis_result'] or ""
+                channel_name = ins['channel_title'] or "채널 미상"
+                
+                # 업로드 날짜 포맷팅
+                pub_at = ins['published_at']
+                if pub_at and isinstance(pub_at, str) and len(pub_at) >= 10:
+                    pub_date_str = pub_at[:10]
+                else:
+                    pub_date_str = "날짜 미상"
                 
                 # JSON 형태의 analysis_result에서 analysis 필드만 추출
                 display_text = analysis
@@ -3300,8 +3351,8 @@ def main():
                 if '\\n' in display_text:
                     display_text = display_text.replace('\\n', '\n')
                 
-                # 개별 항목 표시
-                part = f"{'='*60}\n[{idx+1}] {title}\n{'='*60}\n\n{display_text}"
+                # 개별 항목 표시 (채널명 + 업로드 날짜 포함)
+                part = f"{'='*60}\n[{idx+1}] {title}\n📺 채널: {channel_name}  |  📅 업로드: {pub_date_str}\n{'='*60}\n\n{display_text}"
                 full_text_parts.append(part)
             
             # 전체 텍스트
