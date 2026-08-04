@@ -17,8 +17,8 @@ import argparse
 from pathlib import Path
 
 # Windows 콘솔 인코딩 문제 해결
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', write_through=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', write_through=True)
 
 
 from wiki import extract_wiki_data, init_wiki_tables, CURRENT_EXTRACTION_VERSION
