@@ -885,7 +885,7 @@ def _render_explore_tab(db_path: str, user_id: int):
         selected_type = st.selectbox("분류", list(type_options.keys()), key="wiki_type_filter")
     with col_period:
         period_options = {"전체": None, "최근 7일": 7, "최근 30일": 30, "최근 90일": 90}
-        selected_period = st.selectbox("기간", list(period_options.keys()), key="wiki_period_filter")
+        selected_period = st.selectbox("기간", list(period_options.keys()), index=1, key="wiki_period_filter")
 
     entities = get_wiki_entities(
         db_path, user_id,
@@ -977,6 +977,26 @@ def _render_entity_detail(db_path: str, entity_id: int, user_id: int):
     claims = get_claims_for_entity(db_path, entity_id, limit=500)
     if claims:
         st.markdown(f"**📢 주요 주장 ({len(claims)}건)**")
+        
+        with st.expander("🤖 뭉탱이로 ChatGPT Pro에 던지기 (프롬프트 복사)"):
+            st.caption("코드 블록 우측 상단의 복사 아이콘을 누른 후, 본인의 ChatGPT 창에 붙여넣기 하세요.")
+            prompt_lines = [
+                f"너는 월스트리트의 탑 티어 애널리스트야. 아래는 내가 유튜브 경제 방송에서 수집한 '{detail['name']}'에 대한 최근 전문가들의 주장 Raw Data야.",
+                "이 데이터를 바탕으로 다음 3가지를 정리해서 완벽한 투자 리포트를 작성해 줘.",
+                "1. 현재 시장의 핵심 쟁점 및 비관론/낙관론 요약",
+                "2. 투자자들이 놓치고 있는 숨은 리스크",
+                "3. 향후 대응 전략\n",
+                "[Data Start]"
+            ]
+            sentiment_kr = {"BULLISH": "🟢강세", "BEARISH": "🔴약세", "NEUTRAL": "🟡중립"}
+            for claim in claims:
+                sent = sentiment_kr.get(claim['sentiment'], "중립")
+                date_str = claim['source_date'] or "날짜 미상"
+                channel = claim['channel_title'] or "알 수 없음"
+                prompt_lines.append(f"- {date_str} | {channel} | {sent}: {claim['claim_text']}")
+            prompt_lines.append("[Data End]")
+            
+            st.code("\n".join(prompt_lines), language="markdown")
 
         sentiment_emoji = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}
         with st.container(height=400, border=True):
@@ -1049,7 +1069,7 @@ def _render_claims_tab(db_path: str, user_id: int):
 
     with col2:
         period_map = {"전체": None, "최근 7일": 7, "최근 30일": 30, "최근 90일": 90}
-        selected_period = st.selectbox("📅 기간", list(period_map.keys()), key="claims_period")
+        selected_period = st.selectbox("📅 기간", list(period_map.keys()), index=1, key="claims_period")
 
     with col3:
         sentiment_filter = st.selectbox("논조", ["전체", "🟢 강세", "🔴 약세", "🟡 중립"], key="claims_sentiment")
