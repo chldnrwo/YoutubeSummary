@@ -2617,21 +2617,35 @@ def main():
                         force_model=force_model_val
                     )
                 
-                # oEmbed API로 채널명 가져오기
+                # 1. YouTube Data API로 정확한 채널명 및 게시일 가져오기 시도
                 url_channel_title = None
+                url_published_at = None
                 try:
-                    oembed_resp = requests.get(
-                        f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json",
-                        timeout=5
-                    )
-                    if oembed_resp.status_code == 200:
-                        url_channel_title = oembed_resp.json().get('author_name')
-                except Exception:
-                    pass
+                    youtube = get_youtube_client()
+                    if youtube:
+                        vid_resp = youtube.videos().list(part="snippet", id=video_id).execute()
+                        if vid_resp.get("items"):
+                            snippet = vid_resp["items"][0]["snippet"]
+                            url_channel_title = snippet.get("channelTitle")
+                            url_published_at = snippet.get("publishedAt")
+                except Exception as e:
+                    print(f"[URL_ANALYSIS] YouTube API fetch failed: {e}")
+                    
+                # 2. API 실패 시 oEmbed API로 채널명이라도 가져오기 (Fallback)
+                if not url_channel_title:
+                    try:
+                        oembed_resp = requests.get(
+                            f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json",
+                            timeout=5
+                        )
+                        if oembed_resp.status_code == 200:
+                            url_channel_title = oembed_resp.json().get('author_name')
+                    except Exception:
+                        pass
                 
                 # 로그인 상태에서만 DB에 저장
                 if is_logged_in and user_id:
-                    db_id = save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=None, category=category, channel_title=url_channel_title)
+                    db_id = save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=url_published_at, category=category, channel_title=url_channel_title)
                     if db_id:
                         try:
                             mark_insight_as_read(user_id, db_id)
