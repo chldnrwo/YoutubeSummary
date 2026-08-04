@@ -28,6 +28,9 @@ import chromadb
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import WebshareProxyConfig
 
+# Wiki 모듈
+from wiki import init_wiki_tables, extract_wiki_data, render_wiki_tab
+
 # YouTube API imports
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -483,7 +486,19 @@ def save_insight(video_id: str, video_url: str, title: str, transcript: str, ana
         )
     except Exception as e:
         print(f"[RAG ERROR] ChromaDB 저장 실패: {e}")
-        
+    
+    # 위키 엔터티·주장 자동 추출
+    try:
+        _api_key = None
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                _api_key = json.load(f).get('GOOGLE_API_KEY', '')
+        if _api_key and user_id:
+            extract_wiki_data(str(DB_PATH), db_id, _api_key, user_id)
+            print(f"[WIKI] 엔터티·주장 추출 완료 (insight_id={db_id})")
+    except Exception as e:
+        print(f"[WIKI ERROR] 위키 추출 실패 (insight_id={db_id}): {e}")
+
     return db_id
 
 
@@ -1920,6 +1935,7 @@ def main():
     _perf_start = _time.time()
     
     init_database()
+    init_wiki_tables(str(DB_PATH))
     _dbg(f"[PERF] init_database: {_time.time()-_perf_start:.3f}s")
     
     # 설정 파일 로드
@@ -2533,7 +2549,7 @@ def main():
     
     # 기존 탭(st.tabs)과 유사한 디자인을 유지하면서 최적화(Lazy Loading)를 달성하기 위해 가로형 라디오 버튼 사용
     if is_logged_in:
-        menus = ["🔗 URL 분석", "📺 구독 피드", "📈 주식 데이터", "📊 컨센서스 분석", "📰 내 신문", "📋 요약 데이터", "💬 RAG 챗봇"]
+        menus = ["🔗 URL 분석", "📺 구독 피드", "📖 위키", "📈 주식 데이터", "📊 컨센서스 분석", "📰 내 신문", "📋 요약 데이터", "💬 RAG 챗봇"]
     else:
         menus = ["🔗 URL 분석"]
         
@@ -3382,6 +3398,10 @@ def main():
                 label_visibility="collapsed",
                 key=f"raw_text_area_{filter_key}"
             )
+
+    elif selected_menu == "📖 위키":
+        wiki_api_key = st.session_state.get('api_key', '')
+        render_wiki_tab(db_path=str(DB_PATH), user_id=user_id, api_key=wiki_api_key)
 
     elif selected_menu == "💬 RAG 챗봇":
         st.subheader("💬 내 지식베이스 챗봇 (RAG)")
