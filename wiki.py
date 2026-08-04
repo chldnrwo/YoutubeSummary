@@ -837,6 +837,35 @@ def render_wiki_tab(db_path: str, user_id: int, api_key: str = None):
 
 def _render_explore_tab(db_path: str, user_id: int):
     """주제 탐색 탭: 엔터티 목록 + 상세 페이지"""
+    
+    # 커스텀 CSS 주입 (위키 탭 UI 개선)
+    st.markdown("""
+    <style>
+        /* 일반 엔터티 버튼 좌측 정렬 및 세로 높이 압축 */
+        div[class*="st-key-ent_"] button {
+            justify-content: flex-start !important;
+            text-align: left !important;
+            padding-left: 15px !important;
+            padding-top: 0.2rem !important;
+            padding-bottom: 0.2rem !important;
+            min-height: 2.2rem !important;
+        }
+        
+        /* 핫 토픽 버튼 트렌디한 호버/그림자 효과 */
+        div[class*="st-key-top_ent_"] button {
+            background: linear-gradient(135deg, #f8faff, #ffffff);
+            border: 1px solid #d0dfff !important;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+            transition: all 0.2s ease-in-out;
+        }
+        div[class*="st-key-top_ent_"] button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 10px rgba(66, 133, 244, 0.15);
+            border-color: #4285f4 !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
     # 상세 페이지 모드
     if 'wiki_selected_entity' in st.session_state:
@@ -897,23 +926,30 @@ def _render_explore_tab(db_path: str, user_id: int):
         type_groups[etype].append(ent)
 
     type_labels = {"COMPANY": "🏢 기업", "TOPIC": "📌 주제", "PERSON": "👤 인물"}
-    for etype in ["COMPANY", "TOPIC", "PERSON"]:
-        if etype in type_groups:
-            group = type_groups[etype]
-            with st.expander(f"{type_labels.get(etype, etype)} ({len(group)}개)", expanded=(etype == "COMPANY")):
-                for ent in group:
-                    col1, col2 = st.columns([5, 1])
-                    with col1:
+    
+    # 세로 길이 축소를 위해 expander 대신 tabs 사용
+    available_etypes = [t for t in ["COMPANY", "TOPIC", "PERSON"] if t in type_groups]
+    if available_etypes:
+        tabs = st.tabs([f"{type_labels.get(t, t)} ({len(type_groups[t])}개)" for t in available_etypes])
+        
+        for idx, etype in enumerate(available_etypes):
+            with tabs[idx]:
+                group = type_groups[etype]
+                # 4열로 더 촘촘하게 배치
+                cols = st.columns(4)
+                for i, ent in enumerate(group):
+                    with cols[i % 4]:
+                        label = f"{ent['name']} ({ent['mention_count']}건)"
+                        if ent.get('last_mentioned'):
+                            label += f" · {ent['last_mentioned'][:10]}"
+                            
                         if st.button(
-                            f"{ent['name']} ({ent['mention_count']}건)",
+                            label,
                             key=f"ent_{ent['id']}",
                             use_container_width=True
                         ):
                             st.session_state['wiki_selected_entity'] = ent['id']
                             st.rerun()
-                    with col2:
-                        if ent.get('last_mentioned'):
-                            st.caption(ent['last_mentioned'][:10])
 
 
 def _render_entity_detail(db_path: str, entity_id: int, user_id: int):
@@ -938,23 +974,19 @@ def _render_entity_detail(db_path: str, entity_id: int, user_id: int):
     st.markdown("---")
 
     # 주장 타임라인
-    claims = get_claims_for_entity(db_path, entity_id)
+    claims = get_claims_for_entity(db_path, entity_id, limit=500)
     if claims:
         st.markdown(f"**📢 주요 주장 ({len(claims)}건)**")
 
         sentiment_emoji = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}
-        for claim in claims:
-            emoji = sentiment_emoji.get(claim['sentiment'], "⚪")
-            date_str = claim['source_date'] or "날짜 미상"
-            channel = claim['channel_title'] or "알 수 없음"
-
-            col_date, col_content = st.columns([1, 5])
-            with col_date:
-                st.caption(f"{date_str}\n{channel}")
-            with col_content:
-                st.write(f"{emoji} {claim['claim_text']}")
-                if claim.get('video_url'):
-                    st.caption(f"📎 [원본 보기]({claim['video_url']})")
+        with st.container(height=400, border=True):
+            for claim in claims:
+                emoji = sentiment_emoji.get(claim['sentiment'], "⚪")
+                date_str = claim['source_date'] or "날짜 미상"
+                channel = claim['channel_title'] or "알 수 없음"
+                
+                link = f" [📎 원본]({claim['video_url']})" if claim.get('video_url') else ""
+                st.markdown(f"**{date_str}** {channel} | {emoji} {claim['claim_text']}{link}")
 
     st.markdown("---")
 
@@ -970,26 +1002,28 @@ def _render_entity_detail(db_path: str, entity_id: int, user_id: int):
                 seen_ids.add(rel['id'])
                 unique_rels.append(rel)
                 
+        cols = st.columns(5)
         for i, rel in enumerate(unique_rels):
-            rel_emoji = {"COMPANY": "🏢", "PERSON": "👤", "TOPIC": "📌"}.get(rel['entity_type'], "📌")
-            if st.button(f"{rel_emoji} {rel['name']}", key=f"rel_{rel['id']}_{i}"):
-                st.session_state['wiki_selected_entity'] = rel['id']
-                st.rerun()
+            with cols[i % 5]:
+                rel_emoji = {"COMPANY": "🏢", "PERSON": "👤", "TOPIC": "📌"}.get(rel['entity_type'], "📌")
+                if st.button(f"{rel_emoji} {rel['name']}", key=f"rel_{rel['id']}_{i}", use_container_width=True):
+                    st.session_state['wiki_selected_entity'] = rel['id']
+                    st.rerun()
 
     st.markdown("---")
 
     # 관련 영상
     if detail['insights']:
         st.markdown(f"**📺 관련 영상 ({len(detail['insights'])}건)**")
-        for ins in detail['insights']:
-            date_str = ins['published_at'][:10] if ins['published_at'] else ""
-            channel = ins['channel_title'] or ""
-            title = ins['title'] or f"영상 {ins['id']}"
-            relevance_badge = {"PRIMARY": "⭐", "SECONDARY": "◾", "MENTION": "·"}.get(ins['relevance'], "·")
-
-            st.write(f"{relevance_badge} **{date_str}** {channel} — {title}")
-            if ins.get('video_url'):
-                st.caption(f"📎 [원본 영상]({ins['video_url']})")
+        with st.container(height=300, border=True):
+            for ins in detail['insights']:
+                date_str = ins['published_at'][:10] if ins['published_at'] else ""
+                channel = ins['channel_title'] or ""
+                title = ins['title'] or f"영상 {ins['id']}"
+                relevance_badge = {"PRIMARY": "⭐", "SECONDARY": "◾", "MENTION": "·"}.get(ins['relevance'], "·")
+                
+                link = f" [📎]({ins['video_url']})" if ins.get('video_url') else ""
+                st.markdown(f"{relevance_badge} **{date_str}** {channel} — {title}{link}")
 
     # 경고 문구
     st.markdown("---")
