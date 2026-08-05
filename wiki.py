@@ -7,6 +7,7 @@ app.py를 import하지 않습니다 (순환 참조 방지).
 import sqlite3
 import json
 import re
+import chromadb
 from datetime import datetime, timedelta
 
 import streamlit as st
@@ -447,6 +448,10 @@ def extract_wiki_data(db_path: str, insight_id: int, api_key: str, user_id: int)
 
         conn.commit()
 
+        # ChromaDB 동기화
+        for eid in set(entity_name_to_id.values()):
+            _sync_entity_to_chroma(db_path, eid)
+
     except Exception as e:
         conn.rollback()
         # 실패 상태 기록 (별도 커밋)
@@ -534,12 +539,55 @@ def merge_entities(db_path: str, keep_id: int, remove_id: int):
         conn.execute("UPDATE wiki_pages SET is_stale = 1 WHERE entity_id = ?", (keep_id,))
 
         conn.commit()
+        
+        # ChromaDB 처리: 제거된 엔터티 벡터 삭제 후 합쳐진 엔터티 갱신
+        try:
+            chroma_path = str(Path(db_path).parent / "chroma_db")
+            chroma_client = chromadb.PersistentClient(path=chroma_path)
+            collection = chroma_client.get_or_create_collection(name="wiki_entities")
+            collection.delete(ids=[str(remove_id)])
+        except Exception:
+            pass
+        _sync_entity_to_chroma(db_path, keep_id)
+        
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
 
+def _sync_entity_to_chroma(db_path: str, entity_id: int):
+    """엔터티의 텍스트 정보를 ChromaDB에 동기화(Upsert)합니다."""
+    try:
+        chroma_path = str(Path(db_path).parent / "chroma_db")
+        chroma_client = chromadb.PersistentClient(path=chroma_path)
+        collection = chroma_client.get_or_create_collection(name="wiki_entities")
+
+        conn = sqlite3.connect(db_path)
+        ent = conn.execute("SELECT name, description, entity_type FROM wiki_entities WHERE id = ?", (entity_id,)).fetchone()
+        if not ent:
+            conn.close()
+            return
+            
+        aliases = conn.execute("SELECT alias FROM wiki_entity_aliases WHERE entity_id = ?", (entity_id,)).fetchall()
+        conn.close()
+        
+        name, desc, etype = ent
+        alias_str = ", ".join([a[0] for a in aliases]) if aliases else ""
+        
+        text_for_embedding = f"이름: {name}"
+        if alias_str:
+            text_for_embedding += f"\n별칭: {alias_str}"
+        if desc:
+            text_for_embedding += f"\n설명: {desc}"
+            
+        collection.upsert(
+            ids=[str(entity_id)],
+            documents=[text_for_embedding],
+            metadatas=[{"name": name, "type": etype}]
+        )
+    except Exception as e:
+        print(f"[위키 시맨틱] 엔터티 동기화 실패: {e}")
 
 # ============================================================
 # 조회 함수
@@ -566,18 +614,48 @@ def get_wiki_entities(db_path: str, user_id: int, entity_type: str = None,
         query += " AND e.entity_type = ?"
         params.append(entity_type)
 
+    semantic_ids = []
     if search:
-        query += """ AND (e.name LIKE ? OR e.id IN (
-            SELECT entity_id FROM wiki_entity_aliases WHERE alias LIKE ?
-        ))"""
-        params.extend([f"%{search}%", f"%{search}%"])
+        try:
+            chroma_path = str(Path(db_path).parent / "chroma_db")
+            chroma_client = chromadb.PersistentClient(path=chroma_path)
+            collection = chroma_client.get_or_create_collection(name="wiki_entities")
+            
+            results = collection.query(
+                query_texts=[search],
+                n_results=100
+            )
+            
+            if results and results['ids'] and results['ids'][0]:
+                semantic_ids = [int(i) for i in results['ids'][0]]
+                
+            if semantic_ids:
+                placeholders = ",".join("?" * len(semantic_ids))
+                query += f" AND e.id IN ({placeholders})"
+                params.extend(semantic_ids)
+            else:
+                query += " AND 1=0"
+        except Exception as e:
+            print(f"[위키 시맨틱] 검색 실패: {e}")
+            query += """ AND (e.name LIKE ? OR e.id IN (
+                SELECT entity_id FROM wiki_entity_aliases WHERE alias LIKE ?
+            ))"""
+            params.extend([f"%{search}%", f"%{search}%"])
 
     if days:
         cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
         query += " AND i.published_at >= ?"
         params.append(cutoff)
 
-    query += " GROUP BY e.id ORDER BY mention_count DESC LIMIT ?"
+    query += " GROUP BY e.id"
+    
+    if search and semantic_ids:
+        order_cases = " ".join([f"WHEN e.id = {sid} THEN {idx}" for idx, sid in enumerate(semantic_ids)])
+        query += f" ORDER BY CASE {order_cases} ELSE 9999 END"
+    else:
+        query += " ORDER BY mention_count DESC"
+        
+    query += " LIMIT ?"
     params.append(limit)
 
     rows = conn.execute(query, params).fetchall()
