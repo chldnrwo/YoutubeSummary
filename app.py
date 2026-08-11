@@ -2534,12 +2534,12 @@ def main():
                         with st.spinner("🤖 재분석 중... (완료 시 자동 새로고침)"):
                             try:
                                 transcript = get_transcript(insight['video_id'])
-                                new_title, new_cat, new_analysis = analyze_with_gemini(transcript, api_key, force_model=force_val)
+                                new_title, new_cat, new_analysis, new_model_name = analyze_with_gemini(transcript, api_key, force_model=force_val)
                                 
                                 conn = sqlite3.connect(DB_PATH)
                                 cursor = conn.cursor()
-                                cursor.execute("UPDATE insights SET title = ?, category = ?, analysis_result = ? WHERE id = ?", 
-                                               (new_title, new_cat, new_analysis, selected_id))
+                                cursor.execute("UPDATE insights SET title = ?, category = ?, analysis_result = ?, model_name = ? WHERE id = ?", 
+                                               (new_title, new_cat, new_analysis, new_model_name, selected_id))
                                 conn.commit()
                                 conn.close()
                                 
