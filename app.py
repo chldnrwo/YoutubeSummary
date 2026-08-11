@@ -181,6 +181,11 @@ def init_database():
         cursor.execute("ALTER TABLE insights ADD COLUMN channel_title TEXT")
     except sqlite3.OperationalError:
         pass
+        
+    try:
+        cursor.execute("ALTER TABLE insights ADD COLUMN model_name TEXT")
+    except sqlite3.OperationalError:
+        pass
     
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_video_id ON insights(video_id)
@@ -441,15 +446,15 @@ def get_current_user_info(youtube) -> dict | None:
         return None
 
 
-def save_insight(video_id: str, video_url: str, title: str, transcript: str, analysis_result: str, user_id: int = None, published_at: str = None, category: str = '그 외', channel_title: str = None):
+def save_insight(video_id: str, video_url: str, title: str, transcript: str, analysis_result: str, user_id: int = None, published_at: str = None, category: str = '그 외', channel_title: str = None, model_name: str = None):
     """분석 결과를 데이터베이스에 저장합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute("""
-        INSERT INTO insights (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category, channel_title)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category, channel_title))
+        INSERT INTO insights (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category, channel_title, model_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (video_id, video_url, title, transcript, analysis_result, user_id, published_at, category, channel_title, model_name))
     db_id = cursor.lastrowid
     
     conn.commit()
@@ -1660,7 +1665,7 @@ def get_transcript(video_id: str) -> str:
             raise Exception(f"자막 추출 중 오류 발생: {error_msg}")
 
 
-def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None) -> tuple[str, str, str]:
+def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None) -> tuple[str, str, str, str]:
     """Gemini를 사용하여 자막 텍스트를 분석합니다."""
     genai.configure(api_key=api_key)
     
@@ -1746,16 +1751,16 @@ def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None) 
                 category = result.get('category', '그 외')
                 analysis = result.get('analysis', response_text)
                 print(f"[DEBUG] Parsed title: {title}, category: {category}")
-                return title, category, analysis
+                return title, category, analysis, target_model_name
             except Exception as e:
                 print(f"[DEBUG] Fixed JSON parsing failed: {e}")
                 title_match = re.search(r'"title"\s*:\s*"([^"]+)"', fixed_json_str)
                 cat_match = re.search(r'"category"\s*:\s*"([^"]+)"', fixed_json_str)
                 title = title_match.group(1) if title_match else "분석 완료"
                 category = cat_match.group(1) if cat_match else "그 외"
-                return title, category, response_text
+                return title, category, response_text, target_model_name
         else:
-            return "분석 완료", "그 외", response_text
+            return "분석 완료", "그 외", response_text, target_model_name
             
     except Exception as e:
         print(f"[DEBUG] JSON parsing error: {e}")
@@ -1763,7 +1768,7 @@ def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None) 
         cat_match = re.search(r'"category"\s*:\s*"([^"]+)"', response.text)
         title = title_match.group(1) if title_match else "분석 완료"
         category = cat_match.group(1) if cat_match else "그 외"
-        return title, category, response.text
+        return title, category, response.text, target_model_name
 
 
 def generate_newspaper_section(category: str, insights_text: str, api_key: str) -> str:
@@ -1789,13 +1794,13 @@ def generate_newspaper_section(category: str, insights_text: str, api_key: str) 
         return f"🚨 기사 작성 중 오류가 발생했습니다: {e}"
 
 
-def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None) -> tuple[str, str, str]:
+def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None) -> tuple[str, str, str, str]:
     """영상을 분석하고 결과를 반환합니다."""
     transcript = get_transcript(video_id)
-    title, category, analysis = analyze_with_gemini(transcript, api_key, force_model=force_model)
+    title, category, analysis, model_name = analyze_with_gemini(transcript, api_key, force_model=force_model)
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at, category=category, channel_title=channel_title)
-    return title, category, analysis
+    save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at, category=category, channel_title=channel_title, model_name=model_name)
+    return title, category, analysis, model_name
 
 
 def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None):
@@ -2483,7 +2488,8 @@ def main():
                 
                 pub_at = insight['published_at']
                 pub_info = f"업로드: {pub_at[:10]} | " if pub_at else ""
-                st.caption(f"Video ID: {insight['video_id']} | {pub_info}저장: {insight['created_at'][:19]}")
+                model_info = f" | 모델: {insight['model_name']}" if 'model_name' in insight.keys() and insight['model_name'] else ""
+                st.caption(f"Video ID: {insight['video_id']} | {pub_info}저장: {insight['created_at'][:19]}{model_info}")
                 st.markdown(f"🔗 [YouTube 링크]({insight['video_url']})")
             with col_thumb:
                 # YouTube 썸네일 자동 생성 (video_id로 URL 생성)
@@ -2611,7 +2617,7 @@ def main():
                     elif "Flash" in selected_model_option:
                         force_model_val = "gemini-2.5-flash"
                         
-                    title, category, analysis_result = analyze_with_gemini(
+                    title, category, analysis_result, model_name = analyze_with_gemini(
                         transcript, 
                         st.session_state['api_key'],
                         force_model=force_model_val
@@ -2645,7 +2651,7 @@ def main():
                 
                 # 로그인 상태에서만 DB에 저장
                 if is_logged_in and user_id:
-                    db_id = save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=url_published_at, category=category, channel_title=url_channel_title)
+                    db_id = save_insight(video_id, youtube_url, title, transcript, analysis_result, user_id=user_id, published_at=url_published_at, category=category, channel_title=url_channel_title, model_name=model_name)
                     if db_id:
                         try:
                             mark_insight_as_read(user_id, db_id)
