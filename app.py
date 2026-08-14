@@ -1665,31 +1665,20 @@ def get_transcript(video_id: str) -> str:
             raise Exception(f"자막 추출 중 오류 발생: {error_msg}")
 
 
-def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None) -> tuple[str, str, str, str]:
-    """Gemini를 사용하여 자막 텍스트를 분석합니다."""
+def _call_gemini(transcript: str, api_key: str, target_model_name: str) -> tuple[str, str]:
+    """Gemini API를 호출하여 응답 텍스트를 반환합니다."""
     genai.configure(api_key=api_key)
     
-    if force_model == "gemini-2.5-flash":
-        target_model_name = "gemini-2.5-flash"
-    elif force_model == "gemini-2.5-flash-lite":
-        target_model_name = "gemini-2.5-flash-lite"
-    else:
-        # 자막 길이에 따라 비용 효율적인 모델 선택 (30,000자 기준 자동 모드)
-        target_model_name = "gemini-2.5-flash-lite" if len(transcript) <= 30000 else "gemini-2.5-flash"
-    
     # Gemini 2.5 모델은 thinking 토큰이 max_output_tokens에 포함됨
-    # thinking에 ~8,000 토큰을 사용하므로, 실제 출력을 위해 충분한 여유 필요
     transcript_len = len(transcript)
     if transcript_len <= 10000:
-        max_tokens = 16384    # 짧은 영상: thinking ~8K + 출력 ~8K
+        max_tokens = 16384
     elif transcript_len <= 30000:
-        max_tokens = 32768    # 중간 영상: thinking ~8K + 출력 ~24K
+        max_tokens = 32768
     elif transcript_len <= 60000:
-        max_tokens = 65536    # 긴 영상: thinking ~10K + 출력 ~55K
+        max_tokens = 65536
     else:
-        max_tokens = 65536    # 매우 긴 영상: 최대값
-    
-    print(f"[DEBUG] 자막 길이: {len(transcript)}자 -> 사용 모델: {target_model_name}, max_output_tokens: {max_tokens}")
+        max_tokens = 65536
     
     model = genai.GenerativeModel(
         model_name=target_model_name,
@@ -1703,72 +1692,140 @@ def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None) 
     
     prompt = f"다음 YouTube 영상 자막을 분석해주세요:\n\n{transcript}"
     response = model.generate_content(prompt)
+    return response.text.strip(), target_model_name
+
+
+def _call_qwen(transcript: str, api_key: str, target_model_name: str) -> tuple[str, str]:
+    """Qwen (DashScope) API를 OpenAI 호환 SDK로 호출합니다."""
+    from openai import OpenAI
+    
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    )
+    
+    # 자막 길이에 따른 max_tokens 결정
+    transcript_len = len(transcript)
+    if transcript_len <= 10000:
+        max_tokens = 8192
+    elif transcript_len <= 30000:
+        max_tokens = 16384
+    elif transcript_len <= 60000:
+        max_tokens = 32768
+    else:
+        max_tokens = 32768
+    
+    prompt = f"다음 YouTube 영상 자막을 분석해주세요:\n\n{transcript}"
+    
+    response = client.chat.completions.create(
+        model=target_model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0,
+        top_p=0.95,
+        max_tokens=max_tokens,
+    )
+    
+    return response.choices[0].message.content.strip(), target_model_name
+
+
+def _parse_analysis_response(response_text: str, target_model_name: str) -> tuple[str, str, str, str]:
+    """LLM 응답 텍스트에서 title, category, analysis를 파싱합니다."""
+    json_str = None
+    
+    # 1. ```json ... ``` 형식 찾기
+    json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1).strip()
+    
+    # 2. ``` ... ``` 형식 (언어 없이)
+    if not json_str and '```' in response_text:
+        code_match = re.search(r'```\s*(.*?)\s*```', response_text, re.DOTALL)
+        if code_match:
+            json_str = code_match.group(1).strip()
+    
+    # 2-1. json_str 앞에 'json' 키워드가 남아있으면 제거
+    if json_str and json_str.startswith('json'):
+        json_str = json_str[4:].strip()
+    
+    # 3. 중괄호로 시작하면 직접 JSON으로 시도
+    if not json_str and response_text.startswith('{'):
+        json_str = response_text
+    
+    # 4. 중괄호가 어딘가에 있으면 추출 시도 (도중에 잘렸을 수 있으므로 끝까지)
+    if not json_str:
+        brace_match = re.search(r'\{.*', response_text, re.DOTALL)
+        if brace_match:
+            json_str = brace_match.group(0)
+    
+    if json_str:
+        fixed_json_str = json_str.strip()
+        if fixed_json_str.endswith('```'):
+            fixed_json_str = fixed_json_str[:-3].strip()
+        
+        if not fixed_json_str.endswith('}'):
+            if fixed_json_str.count('"') % 2 != 0:
+                fixed_json_str += '"'
+            fixed_json_str += '\n}'
+            
+        try:
+            result = json.loads(fixed_json_str, strict=False)
+            title = result.get('title', '제목 없음')
+            category = result.get('category', '그 외')
+            analysis = result.get('analysis', response_text)
+            print(f"[DEBUG] Parsed title: {title}, category: {category}")
+            return title, category, analysis, target_model_name
+        except Exception as e:
+            print(f"[DEBUG] Fixed JSON parsing failed: {e}")
+            title_match = re.search(r'"title"\s*:\s*"([^"]+)"', fixed_json_str)
+            cat_match = re.search(r'"category"\s*:\s*"([^"]+)"', fixed_json_str)
+            title = title_match.group(1) if title_match else "분석 완료"
+            category = cat_match.group(1) if cat_match else "그 외"
+            return title, category, response_text, target_model_name
+    else:
+        return "분석 완료", "그 외", response_text, target_model_name
+
+
+# Qwen 모델 목록 (force_model 값으로 사용)
+QWEN_MODELS = {"qwen-flash"}
+
+def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None, qwen_api_key: str = None) -> tuple[str, str, str, str]:
+    """자막 텍스트를 분석합니다. Gemini 또는 Qwen 모델을 사용합니다."""
+    
+    # Qwen 모델 분기 처리
+    if force_model and force_model in QWEN_MODELS:
+        if not qwen_api_key:
+            raise ValueError("Qwen 모델을 사용하려면 Qwen API Key가 필요합니다. 사이드바에서 설정해주세요.")
+        
+        print(f"[DEBUG] 자막 길이: {len(transcript)}자 -> 사용 모델: {force_model} (Qwen)")
+        try:
+            response_text, model_name = _call_qwen(transcript, qwen_api_key, force_model)
+            print(f"[DEBUG] Qwen response (first 500 chars): {response_text[:500]}")
+            return _parse_analysis_response(response_text, model_name)
+        except Exception as e:
+            print(f"[DEBUG] Qwen API error: {e}")
+            raise
+    
+    # Gemini 모델 처리 (기존 로직)
+    if force_model == "gemini-2.5-flash":
+        target_model_name = "gemini-2.5-flash"
+    elif force_model == "gemini-2.5-flash-lite":
+        target_model_name = "gemini-2.5-flash-lite"
+    else:
+        # 자막 길이에 따라 비용 효율적인 모델 선택 (30,000자 기준 자동 모드)
+        target_model_name = "gemini-2.5-flash-lite" if len(transcript) <= 30000 else "gemini-2.5-flash"
+    
+    print(f"[DEBUG] 자막 길이: {len(transcript)}자 -> 사용 모델: {target_model_name}, Gemini")
     
     try:
-        response_text = response.text.strip()
+        response_text, model_name = _call_gemini(transcript, api_key, target_model_name)
         print(f"[DEBUG] Gemini response (first 500 chars): {response_text[:500]}")
-        
-        json_str = None
-        
-        # 1. ```json ... ``` 형식 찾기
-        json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1).strip()
-        
-        # 2. ``` ... ``` 형식 (언어 없이)
-        if not json_str and '```' in response_text:
-            code_match = re.search(r'```\s*(.*?)\s*```', response_text, re.DOTALL)
-            if code_match:
-                json_str = code_match.group(1).strip()
-        
-        # 2-1. json_str 앞에 'json' 키워드가 남아있으면 제거
-        if json_str and json_str.startswith('json'):
-            json_str = json_str[4:].strip()
-        
-        # 3. 중괄호로 시작하면 직접 JSON으로 시도
-        if not json_str and response_text.startswith('{'):
-            json_str = response_text
-        
-        # 4. 중괄호가 어딘가에 있으면 추출 시도 (도중에 잘렸을 수 있으므로 끝까지)
-        if not json_str:
-            brace_match = re.search(r'\{.*', response_text, re.DOTALL)
-            if brace_match:
-                json_str = brace_match.group(0)
-        
-        if json_str:
-            fixed_json_str = json_str.strip()
-            if fixed_json_str.endswith('```'):
-                fixed_json_str = fixed_json_str[:-3].strip()
-            
-            if not fixed_json_str.endswith('}'):
-                if fixed_json_str.count('"') % 2 != 0:
-                    fixed_json_str += '"'
-                fixed_json_str += '\n}'
-                
-            try:
-                result = json.loads(fixed_json_str, strict=False)
-                title = result.get('title', '제목 없음')
-                category = result.get('category', '그 외')
-                analysis = result.get('analysis', response_text)
-                print(f"[DEBUG] Parsed title: {title}, category: {category}")
-                return title, category, analysis, target_model_name
-            except Exception as e:
-                print(f"[DEBUG] Fixed JSON parsing failed: {e}")
-                title_match = re.search(r'"title"\s*:\s*"([^"]+)"', fixed_json_str)
-                cat_match = re.search(r'"category"\s*:\s*"([^"]+)"', fixed_json_str)
-                title = title_match.group(1) if title_match else "분석 완료"
-                category = cat_match.group(1) if cat_match else "그 외"
-                return title, category, response_text, target_model_name
-        else:
-            return "분석 완료", "그 외", response_text, target_model_name
-            
+        return _parse_analysis_response(response_text, model_name)
     except Exception as e:
-        print(f"[DEBUG] JSON parsing error: {e}")
-        title_match = re.search(r'"title"\s*:\s*"([^"]+)"', response.text)
-        cat_match = re.search(r'"category"\s*:\s*"([^"]+)"', response.text)
-        title = title_match.group(1) if title_match else "분석 완료"
-        category = cat_match.group(1) if cat_match else "그 외"
-        return title, category, response.text, target_model_name
+        print(f"[DEBUG] Gemini API error: {e}")
+        raise
 
 
 def generate_newspaper_section(category: str, insights_text: str, api_key: str) -> str:
@@ -1794,16 +1851,16 @@ def generate_newspaper_section(category: str, insights_text: str, api_key: str) 
         return f"🚨 기사 작성 중 오류가 발생했습니다: {e}"
 
 
-def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None) -> tuple[str, str, str, str]:
+def analyze_video(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None, qwen_api_key: str = None) -> tuple[str, str, str, str]:
     """영상을 분석하고 결과를 반환합니다."""
     transcript = get_transcript(video_id)
-    title, category, analysis, model_name = analyze_with_gemini(transcript, api_key, force_model=force_model)
+    title, category, analysis, model_name = analyze_with_gemini(transcript, api_key, force_model=force_model, qwen_api_key=qwen_api_key)
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     save_insight(video_id, video_url, title, transcript, analysis, user_id=user_id, published_at=published_at, category=category, channel_title=channel_title, model_name=model_name)
     return title, category, analysis, model_name
 
 
-def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None):
+def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_at: str = None, force_model: str = None, channel_title: str = None, qwen_api_key: str = None):
     """영상 분석을 ThreadPoolExecutor에 제출합니다."""
     with _analysis_lock:
         # 이미 진행 중이거나 완료된 경우 스킵
@@ -1815,7 +1872,7 @@ def submit_analysis(video_id: str, api_key: str, user_id: int = None, published_
         try:
             with _analysis_lock:
                 _analysis_status[video_id] = 'running'
-            analyze_video(video_id, api_key, user_id=user_id, published_at=published_at, force_model=force_model, channel_title=channel_title)
+            analyze_video(video_id, api_key, user_id=user_id, published_at=published_at, force_model=force_model, channel_title=channel_title, qwen_api_key=qwen_api_key)
             with _analysis_lock:
                 _analysis_status[video_id] = 'done'
         except Exception as e:
@@ -1945,17 +2002,21 @@ def main():
     
     # 설정 파일 로드
     default_api_key = ""
+    default_qwen_api_key = ""
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 default_api_key = config.get("GOOGLE_API_KEY", "")
+                default_qwen_api_key = config.get("QWEN_API_KEY", "")
         except Exception:
             pass
     
     # 세션 상태에 API 키가 없으면 설정 파일 값 사용
     if 'api_key' not in st.session_state and default_api_key:
         st.session_state['api_key'] = default_api_key
+    if 'qwen_api_key' not in st.session_state and default_qwen_api_key:
+        st.session_state['qwen_api_key'] = default_qwen_api_key
     
     # URL 파라미터에서 OAuth 콜백 처리
     # URL 파라미터에서 OAuth 콜백 처리
@@ -2243,7 +2304,22 @@ def main():
         
         if api_key:
             st.session_state['api_key'] = api_key
-            st.success("✅ API Key 설정됨")
+            st.success("✅ Google API Key 설정됨")
+        
+        # Qwen (DashScope) API 키 입력
+        qwen_api_key = st.text_input(
+            "🔑 Qwen API Key (선택)",
+            type="password",
+            value=st.session_state.get('qwen_api_key', default_qwen_api_key),
+            placeholder="sk-...",
+            help="Alibaba Cloud DashScope에서 발급받은 API Key. Qwen 모델 사용 시 필요합니다."
+        )
+        
+        if qwen_api_key:
+            st.session_state['qwen_api_key'] = qwen_api_key
+            st.success("✅ Qwen API Key 설정됨")
+        else:
+            st.session_state['qwen_api_key'] = ''
         
         st.markdown("---")
         
@@ -2519,22 +2595,33 @@ def main():
             if st.session_state.get('show_reanalyze'):
                 st.markdown("---")
                 st.info("💡 모델을 변경하여 이 영상을 다시 분석하고 결과를 덮어씁니다.")
+                _reanalyze_options = ["Gemini 2.5 Flash (고품질)", "Gemini 2.5 Flash Lite (저비용)"]
+                if st.session_state.get('qwen_api_key'):
+                    _reanalyze_options.append("Qwen Flash (저비용, 고성능)")
                 re_model_opt = st.selectbox(
                     "재분석 모델", 
-                    ["Gemini 2.5 Flash (고품질)", "Gemini 2.5 Flash Lite (저비용)"], 
+                    _reanalyze_options, 
                     index=0,
                     key="reanalyze_model_select"
                 )
                 if st.button("🚀 선택한 모델로 다시 돌리기", type="primary"):
-                    force_val = "gemini-2.5-flash" if "Flash (" in re_model_opt else "gemini-2.5-flash-lite"
+                    if "Qwen" in re_model_opt:
+                        force_val = "qwen-flash"
+                    elif "Flash (" in re_model_opt:
+                        force_val = "gemini-2.5-flash"
+                    else:
+                        force_val = "gemini-2.5-flash-lite"
                     api_key = st.session_state.get('api_key', '')
-                    if not api_key:
+                    if not api_key and force_val not in QWEN_MODELS:
                         st.error("API Key가 설정되어 있지 않습니다.")
                     else:
                         with st.spinner("🤖 재분석 중... (완료 시 자동 새로고침)"):
                             try:
                                 transcript = get_transcript(insight['video_id'])
-                                new_title, new_cat, new_analysis, new_model_name = analyze_with_gemini(transcript, api_key, force_model=force_val)
+                                new_title, new_cat, new_analysis, new_model_name = analyze_with_gemini(
+                                    transcript, api_key, force_model=force_val,
+                                    qwen_api_key=st.session_state.get('qwen_api_key', '')
+                                )
                                 
                                 conn = sqlite3.connect(DB_PATH)
                                 cursor = conn.cursor()
@@ -2575,9 +2662,13 @@ def main():
         
         col_model, col_btn = st.columns([4, 1])
         with col_model:
+            # Qwen API 키가 있으면 Qwen 옵션도 표시
+            _model_options = ["자동 (길이 기준 최적화)", "Gemini 2.5 Flash (고품질, 권장)", "Gemini 2.5 Flash Lite (저비용)"]
+            if st.session_state.get('qwen_api_key'):
+                _model_options.append("Qwen Flash (저비용, 고성능)")
             selected_model_option = st.selectbox(
                 "분석 모델 선택",
-                options=["자동 (길이 기준 최적화)", "Gemini 2.5 Flash (고품질, 권장)", "Gemini 2.5 Flash Lite (저비용)"],
+                options=_model_options,
                 index=0,
                 label_visibility="collapsed"
             )
@@ -2612,7 +2703,9 @@ def main():
                 
                 with st.spinner("🤖 AI 분석 중..."):
                     force_model_val = None
-                    if "Flash Lite" in selected_model_option:
+                    if "Qwen" in selected_model_option:
+                        force_model_val = "qwen-flash"
+                    elif "Flash Lite" in selected_model_option:
                         force_model_val = "gemini-2.5-flash-lite"
                     elif "Flash" in selected_model_option:
                         force_model_val = "gemini-2.5-flash"
@@ -2620,7 +2713,8 @@ def main():
                     title, category, analysis_result, model_name = analyze_with_gemini(
                         transcript, 
                         st.session_state['api_key'],
-                        force_model=force_model_val
+                        force_model=force_model_val,
+                        qwen_api_key=st.session_state.get('qwen_api_key', '')
                     )
                 
                 # 1. YouTube Data API로 정확한 채널명 및 게시일 가져오기 시도

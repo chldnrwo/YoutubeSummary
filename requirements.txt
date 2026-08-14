@@ -9,3 +9,4 @@ extra-streamlit-components>=0.1.71
 chromadb>=0.4.24
 pandas>=2.0.0
 lxml
+openai>=1.0.0
