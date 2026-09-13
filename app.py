@@ -3504,14 +3504,16 @@ def main():
             with col_info:
                 st.caption(f"💡 아래 텍스트를 직접 복사하거나, 다운로드 버튼을 사용하세요.")
             
-            # 전체 텍스트를 text_area로 표시 (복사 편의)
-            st.text_area(
-                "요약 데이터 전체",
-                value=full_text,
-                height=600,
-                label_visibility="collapsed",
-                key=f"raw_text_area_{filter_key}"
-            )
+            # 영상별 expander로 분할 표시 (대용량 text_area 크래시 방지)
+            for idx, ins in enumerate(filtered_insights):
+                title = ins['title'] if ins['title'] else f"영상 {ins['video_id'][:8]}..."
+                channel_name = ins['channel_title'] or "채널 미상"
+                pub_at = ins['published_at']
+                pub_date_str = pub_at[:10] if pub_at and isinstance(pub_at, str) and len(pub_at) >= 10 else "날짜 미상"
+                
+                with st.expander(f"[{idx+1}] {title}  —  📺 {channel_name}  |  📅 {pub_date_str}", expanded=False):
+                    # full_text_parts에서 해당 인덱스의 텍스트를 가져옴
+                    st.text(full_text_parts[idx])
 
     elif selected_menu == "📖 위키":
         wiki_api_key = st.session_state.get('api_key', '')
