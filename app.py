@@ -2422,143 +2422,178 @@ def main():
         
         st.markdown("---")
         
-        # 저장된 분석 목록 (로그인 시만 표시)
-        if is_logged_in and user_id:
-            col_header, col_refresh = st.columns([5, 1])
-            with col_header:
-                st.header("📚 저장된 분석")
-            with col_refresh:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("🔄", key="refresh_insights", help="분석 목록 새로고침"):
-                    st.rerun()
-            
-            _t = _time.time()
-            insights = get_all_insights(user_id=user_id)
-            _dbg(f"[PERF] get_all_insights ({len(insights)} rows): {_time.time()-_t:.3f}s")
-            
-            if insights:
-                today_insights = []
-                week_insights = []
-                past_insights = []
+        # 현재 메뉴 상태에 따라 사이드바 콘텐츠 분기
+        current_menu = st.session_state.get('current_menu', '')
+        
+        if current_menu == "💬 RAG 챗봇" and is_logged_in and user_id:
+            # RAG 챗봇 탭 선택 시: RAG 세션 목록만 표시
+            st.header("💬 대화 세션")
+            if st.button("➕ 새 대화 시작", use_container_width=True, key="sidebar_new_session"):
+                st.session_state.current_rag_session_id = None
+                st.session_state.rag_messages = []
+                st.rerun()
                 
-                now = datetime.utcnow()
-                
-                for insight in insights:
-                    created_at_str = insight['created_at']
-                    try:
-                        created_dt = datetime.strptime(created_at_str[:19], '%Y-%m-%d %H:%M:%S')
-                    except Exception:
-                        created_dt = now
-                        
-                    diff = now - created_dt
-                    
-                    if diff.total_seconds() <= 24 * 3600:
-                        today_insights.append(insight)
-                    elif diff.total_seconds() <= 168 * 3600:
-                        week_insights.append(insight)
-                    else:
-                        past_insights.append(insight)
-                        
-                def render_insight_list(insight_list, prefix=""):
-                    for insight in insight_list:
-                        col1, col2 = st.columns([5, 1])
-                        with col1:
-                            title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
-                            viewed = st.session_state.get('viewed_insights', set())
-                            is_viewed = insight['id'] in viewed
-                            is_current = st.session_state.get('selected_insight_id') == insight['id']
-                            
-                            if is_current:
-                                icon = "👉"
-                            elif is_viewed:
-                                icon = "✅"
-                            else:
-                                icon = "💾"
-                            btn_label = f"{icon} {title}"
-                            if st.button(btn_label[:30] + ("..." if len(btn_label) > 30 else ""), key=f"{prefix}view_{insight['id']}", use_container_width=True):
-                                st.session_state['selected_insight_id'] = insight['id']
-                                if 'viewed_insights' not in st.session_state:
-                                    st.session_state['viewed_insights'] = set()
-                                st.session_state['viewed_insights'].add(insight['id'])
-                                try:
-                                    mark_insight_as_read(user_id, insight['id'])
-                                except Exception as e:
-                                    print(f"[DB ERROR] 읽음 처리 기록 실패: {e}")
-                                st.rerun()
-                        with col2:
-                            if st.button("🗑️", key=f"{prefix}del_{insight['id']}"):
-                                delete_insight(insight['id'])
-                                st.rerun()
-
-                if today_insights:
-                    st.markdown(f"**🔹 오늘 분석** ({len(today_insights)}개)")
-                    render_insight_list(today_insights, prefix="today_")
-                    
-                if week_insights:
-                    WEEK_PAGE_SIZE = 20
-                    week_total_pages = (len(week_insights) + WEEK_PAGE_SIZE - 1) // WEEK_PAGE_SIZE
-                    
-                    if 'week_page' not in st.session_state:
-                        st.session_state['week_page'] = 0
-                    week_current_page = st.session_state['week_page']
-                    week_current_page = max(0, min(week_current_page, week_total_pages - 1))
-                    
-                    week_start = week_current_page * WEEK_PAGE_SIZE
-                    week_end = min(week_start + WEEK_PAGE_SIZE, len(week_insights))
-                    week_page_items = week_insights[week_start:week_end]
-                    
-                    with st.expander(f"**🔸 금주 분석** ({len(week_insights)}개)"):
-                        if week_total_pages > 1:
-                            wn1, wn2, wn3 = st.columns([1, 2, 1])
-                            with wn1:
-                                if st.button("◀ 이전", key="week_prev", disabled=(week_current_page == 0), use_container_width=True):
-                                    st.session_state['week_page'] = week_current_page - 1
-                                    st.rerun()
-                            with wn2:
-                                st.markdown(f"<div style='text-align:center; padding:5px;'>{week_current_page + 1} / {week_total_pages} 페이지</div>", unsafe_allow_html=True)
-                            with wn3:
-                                if st.button("다음 ▶", key="week_next", disabled=(week_current_page >= week_total_pages - 1), use_container_width=True):
-                                    st.session_state['week_page'] = week_current_page + 1
-                                    st.rerun()
-                        render_insight_list(week_page_items, prefix="week_")
-                        
-                if past_insights:
-                    PAGE_SIZE = 20
-                    total_pages = (len(past_insights) + PAGE_SIZE - 1) // PAGE_SIZE
-                    
-                    if 'past_page' not in st.session_state:
-                        st.session_state['past_page'] = 0
-                    current_page = st.session_state['past_page']
-                    current_page = max(0, min(current_page, total_pages - 1))
-                    
-                    start_idx = current_page * PAGE_SIZE
-                    end_idx = min(start_idx + PAGE_SIZE, len(past_insights))
-                    page_items = past_insights[start_idx:end_idx]
-                    
-                    with st.expander(f"**📂 과거 분석** ({len(past_insights)}개)", expanded=False):
-                        _t = _time.time()
-                        
-                        # 페이지 네비게이션 (상단)
-                        if total_pages > 1:
-                            nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
-                            with nav_col1:
-                                if st.button("◀ 이전", key="past_prev", disabled=(current_page == 0), use_container_width=True):
-                                    st.session_state['past_page'] = current_page - 1
-                                    st.rerun()
-                            with nav_col2:
-                                st.markdown(f"<div style='text-align:center; padding:5px;'>{current_page + 1} / {total_pages} 페이지</div>", unsafe_allow_html=True)
-                            with nav_col3:
-                                if st.button("다음 ▶", key="past_next", disabled=(current_page >= total_pages - 1), use_container_width=True):
-                                    st.session_state['past_page'] = current_page + 1
-                                    st.rerun()
-                        
-                        render_insight_list(page_items, prefix="past_")
-                        _dbg(f"[PERF] render past_insights ({len(page_items)}/{len(past_insights)} items, page {current_page+1}/{total_pages}): {_time.time()-_t:.3f}s")
+            sessions = get_rag_sessions(user_id)
+            if sessions:
+                for s in sessions:
+                    col_title, col_del = st.columns([8, 2])
+                    with col_title:
+                        is_active = (st.session_state.get('current_rag_session_id') == s['id'])
+                        title_display = f"💬 {s['title']}" if is_active else s['title']
+                        if st.button(title_display, key=f"sb_session_{s['id']}", use_container_width=True):
+                            st.session_state.current_rag_session_id = s['id']
+                            st.session_state.rag_messages = get_rag_history(user_id, limit=50, session_id=s['id'])
+                            st.rerun()
+                    with col_del:
+                        if st.button("🗑️", key=f"sb_sdel_{s['id']}", help="세션 삭제"):
+                            delete_rag_session(s['id'])
+                            if st.session_state.get('current_rag_session_id') == s['id']:
+                                st.session_state.current_rag_session_id = None
+                                st.session_state.rag_messages = []
+                            st.rerun()
             else:
-                st.caption("저장된 분석이 없습니다.")
+                st.caption("아직 대화 기록이 없습니다.")
+        else:
+            # 기타 탭 선택 시: 기존 유튜브 분석 목록 표시
+        
+            # 저장된 분석 목록 (로그인 시만 표시)
+            if is_logged_in and user_id:
+                col_header, col_refresh = st.columns([5, 1])
+                with col_header:
+                    st.header("📚 저장된 분석")
+                with col_refresh:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("🔄", key="refresh_insights", help="분석 목록 새로고침"):
+                        st.rerun()
+                
+                _t = _time.time()
+                insights = get_all_insights(user_id=user_id)
+                _dbg(f"[PERF] get_all_insights ({len(insights)} rows): {_time.time()-_t:.3f}s")
+                
+                if insights:
+                    today_insights = []
+                    week_insights = []
+                    past_insights = []
+                    
+                    now = datetime.utcnow()
+                    
+                    for insight in insights:
+                        created_at_str = insight['created_at']
+                        try:
+                            created_dt = datetime.strptime(created_at_str[:19], '%Y-%m-%d %H:%M:%S')
+                        except Exception:
+                            created_dt = now
+                            
+                        diff = now - created_dt
+                        
+                        if diff.total_seconds() <= 24 * 3600:
+                            today_insights.append(insight)
+                        elif diff.total_seconds() <= 168 * 3600:
+                            week_insights.append(insight)
+                        else:
+                            past_insights.append(insight)
+                            
+                    def render_insight_list(insight_list, prefix=""):
+                        for insight in insight_list:
+                            col1, col2 = st.columns([5, 1])
+                            with col1:
+                                title = insight['title'] if insight['title'] else f"영상 {insight['video_id'][:8]}..."
+                                viewed = st.session_state.get('viewed_insights', set())
+                                is_viewed = insight['id'] in viewed
+                                is_current = st.session_state.get('selected_insight_id') == insight['id']
+                                
+                                if is_current:
+                                    icon = "👉"
+                                elif is_viewed:
+                                    icon = "✅"
+                                else:
+                                    icon = "💾"
+                                btn_label = f"{icon} {title}"
+                                if st.button(btn_label[:30] + ("..." if len(btn_label) > 30 else ""), key=f"{prefix}view_{insight['id']}", use_container_width=True):
+                                    st.session_state['selected_insight_id'] = insight['id']
+                                    if 'viewed_insights' not in st.session_state:
+                                        st.session_state['viewed_insights'] = set()
+                                    st.session_state['viewed_insights'].add(insight['id'])
+                                    try:
+                                        mark_insight_as_read(user_id, insight['id'])
+                                    except Exception as e:
+                                        print(f"[DB ERROR] 읽음 처리 기록 실패: {e}")
+                                    st.rerun()
+                            with col2:
+                                if st.button("🗑️", key=f"{prefix}del_{insight['id']}"):
+                                    delete_insight(insight['id'])
+                                    st.rerun()
+
+                    if today_insights:
+                        st.markdown(f"**🔹 오늘 분석** ({len(today_insights)}개)")
+                        render_insight_list(today_insights, prefix="today_")
+                        
+                    if week_insights:
+                        WEEK_PAGE_SIZE = 20
+                        week_total_pages = (len(week_insights) + WEEK_PAGE_SIZE - 1) // WEEK_PAGE_SIZE
+                        
+                        if 'week_page' not in st.session_state:
+                            st.session_state['week_page'] = 0
+                        week_current_page = st.session_state['week_page']
+                        week_current_page = max(0, min(week_current_page, week_total_pages - 1))
+                        
+                        week_start = week_current_page * WEEK_PAGE_SIZE
+                        week_end = min(week_start + WEEK_PAGE_SIZE, len(week_insights))
+                        week_page_items = week_insights[week_start:week_end]
+                        
+                        with st.expander(f"**🔸 금주 분석** ({len(week_insights)}개)"):
+                            if week_total_pages > 1:
+                                wn1, wn2, wn3 = st.columns([1, 2, 1])
+                                with wn1:
+                                    if st.button("◀ 이전", key="week_prev", disabled=(week_current_page == 0), use_container_width=True):
+                                        st.session_state['week_page'] = week_current_page - 1
+                                        st.rerun()
+                                with wn2:
+                                    st.markdown(f"<div style='text-align:center; padding:5px;'>{week_current_page + 1} / {week_total_pages} 페이지</div>", unsafe_allow_html=True)
+                                with wn3:
+                                    if st.button("다음 ▶", key="week_next", disabled=(week_current_page >= week_total_pages - 1), use_container_width=True):
+                                        st.session_state['week_page'] = week_current_page + 1
+                                        st.rerun()
+                            render_insight_list(week_page_items, prefix="week_")
+                            
+                    if past_insights:
+                        PAGE_SIZE = 20
+                        total_pages = (len(past_insights) + PAGE_SIZE - 1) // PAGE_SIZE
+                        
+                        if 'past_page' not in st.session_state:
+                            st.session_state['past_page'] = 0
+                        current_page = st.session_state['past_page']
+                        current_page = max(0, min(current_page, total_pages - 1))
+                        
+                        start_idx = current_page * PAGE_SIZE
+                        end_idx = min(start_idx + PAGE_SIZE, len(past_insights))
+                        page_items = past_insights[start_idx:end_idx]
+                        
+                        with st.expander(f"**📂 과거 분석** ({len(past_insights)}개)", expanded=False):
+                            _t = _time.time()
+                            
+                            # 페이지 네비게이션 (상단)
+                            if total_pages > 1:
+                                nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+                                with nav_col1:
+                                    if st.button("◀ 이전", key="past_prev", disabled=(current_page == 0), use_container_width=True):
+                                        st.session_state['past_page'] = current_page - 1
+                                        st.rerun()
+                                with nav_col2:
+                                    st.markdown(f"<div style='text-align:center; padding:5px;'>{current_page + 1} / {total_pages} 페이지</div>", unsafe_allow_html=True)
+                                with nav_col3:
+                                    if st.button("다음 ▶", key="past_next", disabled=(current_page >= total_pages - 1), use_container_width=True):
+                                        st.session_state['past_page'] = current_page + 1
+                                        st.rerun()
+                            
+                            render_insight_list(page_items, prefix="past_")
+                            _dbg(f"[PERF] render past_insights ({len(page_items)}/{len(past_insights)} items, page {current_page+1}/{total_pages}): {_time.time()-_t:.3f}s")
+                else:
+                    st.caption("저장된 분석이 없습니다.")
         
         st.markdown("---")
         st.caption("Powered by Google Gemini 2.5 Flash")
+    
     
     # ============================================================
     # 메인 화면
@@ -2746,6 +2781,7 @@ def main():
         menus = ["🔗 URL 분석"]
         
     selected_menu = st.radio("📌 메뉴 선택", menus, horizontal=True, label_visibility="collapsed")
+    st.session_state['current_menu'] = selected_menu
     
     # ============================================================
     # 탭 1: URL 직접 입력 분석
@@ -3627,36 +3663,6 @@ def main():
             st.session_state.current_rag_session_id = None
         if 'rag_messages' not in st.session_state:
             st.session_state.rag_messages = []
-            
-        # 로그인 사용자만 사이드바에 세션 관리 표시
-        if user_id:
-            with st.sidebar:
-                st.markdown("---")
-                st.markdown("### 💬 대화 세션")
-                if st.button("➕ 새 대화 시작", use_container_width=True):
-                    st.session_state.current_rag_session_id = None
-                    st.session_state.rag_messages = []
-                    st.rerun()
-                    
-                st.markdown("#### 이전 대화")
-                sessions = get_rag_sessions(user_id)
-                for s in sessions:
-                    col_title, col_del = st.columns([8, 2])
-                    with col_title:
-                        # 활성화된 세션은 굵게 표시
-                        is_active = (st.session_state.current_rag_session_id == s['id'])
-                        title_display = f"**{s['title']}**" if is_active else s['title']
-                        if st.button(title_display, key=f"session_btn_{s['id']}", use_container_width=True):
-                            st.session_state.current_rag_session_id = s['id']
-                            st.session_state.rag_messages = get_rag_history(user_id, limit=50, session_id=s['id'])
-                            st.rerun()
-                    with col_del:
-                        if st.button("🗑️", key=f"session_del_{s['id']}", help="세션 삭제"):
-                            delete_rag_session(s['id'])
-                            if st.session_state.current_rag_session_id == s['id']:
-                                st.session_state.current_rag_session_id = None
-                                st.session_state.rag_messages = []
-                            st.rerun()
 
         # 상단 필터 및 옵션
         with st.expander("🔧 검색 필터 및 설정", expanded=False):
