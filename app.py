@@ -356,73 +356,151 @@ def upsert_user(channel_id: str, name: str = None, profile_image: str = None) ->
     return user_id
 
 
-def save_rag_chat(user_id: int, query: str, response: str):
-    """RAG 챗봇 대화 기록을 DB에 저장합니다."""
+def create_rag_session(user_id: int, title: str) -> int:
+    """새로운 RAG 세션을 생성하고 session_id를 반환합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO rag_chat_history (user_id, query, response)
-        VALUES (?, ?, ?)
-    """, (user_id, query, response))
+        INSERT INTO rag_sessions (user_id, title)
+        VALUES (?, ?)
+    """, (user_id, title))
+    session_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return session_id
+
+def get_rag_sessions(user_id: int) -> list:
+    """사용자의 모든 RAG 세션 목록을 반환합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT id, title, created_at
+            FROM rag_sessions
+            WHERE user_id = ?
+            ORDER BY id DESC
+        """, (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [{'id': r[0], 'title': r[1], 'created_at': r[2]} for r in rows]
+    except Exception:
+        conn.close()
+        return []
+
+def delete_rag_session(session_id: int):
+    """특정 RAG 세션과 관련 대화 기록을 삭제합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM rag_chat_history WHERE session_id = ?", (session_id,))
+    cursor.execute("DELETE FROM rag_sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+def save_rag_chat(user_id: int, query: str, response: str, session_id: int = None):
+    """RAG 챗봇 대화 기록을 DB에 저장합니다."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if session_id:
+        cursor.execute("""
+            INSERT INTO rag_chat_history (user_id, query, response, session_id)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, query, response, session_id))
+    else:
+        cursor.execute("""
+            INSERT INTO rag_chat_history (user_id, query, response)
+            VALUES (?, ?, ?)
+        """, (user_id, query, response))
     conn.commit()
     conn.close()
 
 
-def get_rag_history(user_id: int, limit: int = 50) -> list:
+def get_rag_history(user_id: int, limit: int = 50, session_id: int = None) -> list:
     """RAG 챗봇 대화 기록을 최근 순(최대 limit개)으로 가져와 시간 역순(과거 -> 최근)으로 반환합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT query, response, created_at
-        FROM rag_chat_history
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    """, (user_id, limit))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    history = []
-    for row in reversed(rows):
-        history.append({
-            'query': row[0],
-            'response': row[1],
-            'created_at': row[2]
-        })
-    return history
+    try:
+        if session_id:
+            cursor.execute("""
+                SELECT query, response, created_at
+                FROM rag_chat_history
+                WHERE user_id = ? AND session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """, (user_id, session_id, limit))
+        else:
+            # session_id가 없으면 구버전 호환 또는 session 없는 기록 조회
+            cursor.execute("""
+                SELECT query, response, created_at
+                FROM rag_chat_history
+                WHERE user_id = ? AND session_id IS NULL
+                ORDER BY id DESC
+                LIMIT ?
+            """, (user_id, limit))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        history = []
+        for row in reversed(rows):
+            history.append({
+                'query': row[0],
+                'response': row[1],
+                'created_at': row[2]
+            })
+        return history
+    except Exception:
+        conn.close()
+        return []
 
 
-def get_all_rag_history(user_id: int) -> list:
+def get_all_rag_history(user_id: int, session_id: int = None) -> list:
     """RAG 챗봇 대화 기록 전체를 역순(최신순)으로 반환합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT query, response, created_at
-        FROM rag_chat_history
-        WHERE user_id = ?
-        ORDER BY id DESC
-    """, (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    history = []
-    for row in rows:
-        history.append({
-            'query': row[0],
-            'response': row[1],
-            'created_at': row[2]
-        })
-    return history
+    try:
+        if session_id:
+            cursor.execute("""
+                SELECT query, response, created_at
+                FROM rag_chat_history
+                WHERE user_id = ? AND session_id = ?
+                ORDER BY id DESC
+            """, (user_id, session_id))
+        else:
+            cursor.execute("""
+                SELECT query, response, created_at
+                FROM rag_chat_history
+                WHERE user_id = ?
+                ORDER BY id DESC
+            """, (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        history = []
+        for row in rows:
+            history.append({
+                'query': row[0],
+                'response': row[1],
+                'created_at': row[2]
+            })
+        return history
+    except Exception:
+        conn.close()
+        return []
 
 
-def clear_rag_history(user_id: int):
+def clear_rag_history(user_id: int, session_id: int = None):
     """RAG 챗봇 대화 기록을 초기화합니다."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
-        DELETE FROM rag_chat_history
-        WHERE user_id = ?
-    """, (user_id,))
+    if session_id:
+        cursor.execute("""
+            DELETE FROM rag_chat_history
+            WHERE user_id = ? AND session_id = ?
+        """, (user_id, session_id))
+    else:
+        cursor.execute("""
+            DELETE FROM rag_chat_history
+            WHERE user_id = ?
+        """, (user_id,))
     conn.commit()
     conn.close()
 
@@ -3544,123 +3622,157 @@ def main():
         st.subheader("💬 내 지식베이스 챗봇 (RAG)")
         st.write("지금까지 분석한 영상들의 내용을 바탕으로 무엇이든 물어보세요!")
         
-        tab_chat, tab_log = st.tabs(["💬 챗봇", "📚 대화 기록 열람"])
-        
-        with tab_log:
-            st.markdown("### 📚 과거 대화 전체 기록")
-            if not user_id:
-                st.warning("로그인이 필요한 기능입니다.")
-            else:
-                all_history = get_all_rag_history(user_id)
-                if not all_history:
-                    st.info("아직 저장된 대화 기록이 없습니다.")
-                else:
-                    for h in all_history:
-                        with st.expander(f"Q: {h['query']} ({h['created_at'][:16]})"):
-                            st.markdown(f"**답변:**\n{h['response']}")
-                            
-        with tab_chat:
-            # 필터 옵션 및 대화 관리
-            with st.expander("🔧 검색 필터 및 설정", expanded=False):
-                filter_col1, filter_col2, filter_col3 = st.columns([3, 3, 2])
-                with filter_col1:
-                    rag_period = st.selectbox(
-                        "📅 기간 필터",
-                        ["전체", "최근 7일", "최근 14일", "최근 30일"],
-                        index=0,
-                        key="rag_period"
-                    )
-                with filter_col2:
-                    rag_category = st.selectbox(
-                        "🏷️ 카테고리 필터",
-                        ["전체", "경제", "IT", "문화", "그 외"],
-                        index=0,
-                        key="rag_category"
-                    )
-                with filter_col3:
-                    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                    if st.button("🗑️ 대화 초기화", use_container_width=True, key="clear_chat"):
-                        st.session_state.rag_messages = []
-                        if user_id:
-                            clear_rag_history(user_id)
-                        st.toast("대화 기록이 초기화되었습니다. 🗑️")
-                        st.rerun()
-
-            # 1. 채팅 영역 컨테이너 생성 (입력창보다 위에 메시지가 고정되도록 함)
-            chat_container = st.container()
-
-            # 2. 이전 대화 기록 로드 및 출력
-            if 'rag_messages' not in st.session_state:
-                st.session_state.rag_messages = get_rag_history(user_id) if user_id else []
-                
-            with chat_container:
-                chat_history = st.session_state.rag_messages
-                for chat in chat_history:
-                    with st.chat_message("user"):
-                        st.write(chat['query'])
-                    with st.chat_message("assistant"):
-                        st.write(chat['response'])
-                    
-            # 3. 새로운 질문 입력 받기
-            rag_query = st.chat_input("질문을 입력하세요 (예: 최근 경제 영상들의 공통 메시지를 정리해줘)...")
+        # 세션 관리를 위한 상태 초기화
+        if 'current_rag_session_id' not in st.session_state:
+            st.session_state.current_rag_session_id = None
+        if 'rag_messages' not in st.session_state:
+            st.session_state.rag_messages = []
             
-            if rag_query:
-                with chat_container:
-                    # 질문 즉시 렌더링
-                    with st.chat_message("user"):
-                        st.write(rag_query)
-                        
-                    # 답변 생성 및 렌더링
-                    with st.chat_message("assistant"):
-                        with st.spinner("지식베이스 검색 및 답변 생성 중 (Agentic RAG)..."):
-                            try:
-                                rag_api_key = st.session_state.get('api_key', '')
-                                if not rag_api_key:
-                                    st.error("API 키가 설정되지 않았습니다. 사이드바에서 설정해주세요.")
-                                    st.stop()
-                                    
-                                agent = RAGAgent(
-                                    db_path=str(DB_PATH),
-                                    chroma_path='chroma_db',
-                                    api_key=rag_api_key,
-                                    user_id=user_id
+        # 로그인 사용자만 사이드바에 세션 관리 표시
+        if user_id:
+            with st.sidebar:
+                st.markdown("---")
+                st.markdown("### 💬 대화 세션")
+                if st.button("➕ 새 대화 시작", use_container_width=True):
+                    st.session_state.current_rag_session_id = None
+                    st.session_state.rag_messages = []
+                    st.rerun()
+                    
+                st.markdown("#### 이전 대화")
+                sessions = get_rag_sessions(user_id)
+                for s in sessions:
+                    col_title, col_del = st.columns([8, 2])
+                    with col_title:
+                        # 활성화된 세션은 굵게 표시
+                        is_active = (st.session_state.current_rag_session_id == s['id'])
+                        title_display = f"**{s['title']}**" if is_active else s['title']
+                        if st.button(title_display, key=f"session_btn_{s['id']}", use_container_width=True):
+                            st.session_state.current_rag_session_id = s['id']
+                            st.session_state.rag_messages = get_rag_history(user_id, limit=50, session_id=s['id'])
+                            st.rerun()
+                    with col_del:
+                        if st.button("🗑️", key=f"session_del_{s['id']}", help="세션 삭제"):
+                            delete_rag_session(s['id'])
+                            if st.session_state.current_rag_session_id == s['id']:
+                                st.session_state.current_rag_session_id = None
+                                st.session_state.rag_messages = []
+                            st.rerun()
+
+        # 상단 필터 및 옵션
+        with st.expander("🔧 검색 필터 및 설정", expanded=False):
+            filter_col1, filter_col2, filter_col3 = st.columns([3, 3, 2])
+            with filter_col1:
+                rag_period = st.selectbox(
+                    "📅 기간 필터",
+                    ["전체", "최근 7일", "최근 14일", "최근 30일"],
+                    index=0,
+                    key="rag_period"
+                )
+            with filter_col2:
+                rag_category = st.selectbox(
+                    "🏷️ 카테고리 필터",
+                    ["전체", "경제", "IT", "문화", "그 외"],
+                    index=0,
+                    key="rag_category"
+                )
+            with filter_col3:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                if st.button("🗑️ 현재 대화 비우기", use_container_width=True, key="clear_chat"):
+                    st.session_state.rag_messages = []
+                    if user_id:
+                        clear_rag_history(user_id, session_id=st.session_state.current_rag_session_id)
+                    st.toast("현재 대화 기록이 초기화되었습니다. 🗑️")
+                    st.rerun()
+
+        # 1. 채팅 영역 컨테이너 생성
+        chat_container = st.container()
+
+        # 2. 초기 로드 (현재 선택된 세션이 없으면 비어있는지 확인)
+        if user_id and st.session_state.current_rag_session_id is not None and not st.session_state.rag_messages:
+            st.session_state.rag_messages = get_rag_history(user_id, session_id=st.session_state.current_rag_session_id)
+            
+        with chat_container:
+            for chat in st.session_state.rag_messages:
+                with st.chat_message("user"):
+                    st.write(chat['query'])
+                with st.chat_message("assistant"):
+                    st.write(chat['response'])
+                
+        # 3. 새로운 질문 입력 받기
+        rag_query = st.chat_input("질문을 입력하세요 (예: 최근 경제 영상들의 공통 메시지를 정리해줘)...")
+        
+        if rag_query:
+            with chat_container:
+                # 질문 즉시 렌더링
+                with st.chat_message("user"):
+                    st.write(rag_query)
+                    
+                # 답변 생성 및 렌더링
+                with st.chat_message("assistant"):
+                    with st.spinner("지식베이스 검색 및 답변 생성 중 (Agentic RAG)..."):
+                        try:
+                            rag_api_key = st.session_state.get('api_key', '')
+                            if not rag_api_key:
+                                st.error("API 키가 설정되지 않았습니다. 사이드바에서 설정해주세요.")
+                                st.stop()
+                                
+                            agent = RAGAgent(
+                                db_path=str(DB_PATH),
+                                chroma_path='chroma_db',
+                                api_key=rag_api_key,
+                                user_id=user_id
+                            )
+                            
+                            filters = {}
+                            if rag_category != "전체":
+                                filters['category'] = rag_category
+                                
+                            if rag_period != "전체":
+                                period_days = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30}
+                                cutoff_date = (datetime.utcnow() - timedelta(days=period_days[rag_period])).strftime("%Y-%m-%d")
+                                filters['cutoff_date'] = cutoff_date
+                                
+                            # 답변 생성 (이전 대화 컨텍스트 전달)
+                            response = agent.answer(rag_query, filters=filters, chat_history=st.session_state.rag_messages)
+                            
+                            # (5) 결과 출력
+                            st.write(response.answer)
+                            
+                            # Source Citation
+                            if response.citations:
+                                st.markdown("---")
+                                st.markdown("**📑 참고 자료 (근거)**")
+                                for idx, c in enumerate(response.citations):
+                                    link = f" [📎 원본]({c.url})" if c.url else ""
+                                    date_str = f" ({c.date})" if c.date else ""
+                                    st.markdown(f"**[{idx+1}] {c.title}{date_str}**{link}\n> {c.excerpt}")
+                            
+                            # 디버그 로그
+                            with st.expander("🛠️ RAG 검색 로그 보기"):
+                                st.json(response.retrieval_log)
+                            
+                            st.session_state.rag_messages.append({'query': rag_query, 'response': response.answer})
+                            
+                            # DB 저장 (멀티 세션 로직)
+                            if user_id:
+                                # 새 대화면 세션 생성
+                                if st.session_state.current_rag_session_id is None:
+                                    title = rag_query[:30] + ("..." if len(rag_query) > 30 else "")
+                                    new_id = create_rag_session(user_id, title)
+                                    st.session_state.current_rag_session_id = new_id
+                                
+                                save_rag_chat(
+                                    user_id=user_id, 
+                                    query=rag_query, 
+                                    response=response.answer, 
+                                    session_id=st.session_state.current_rag_session_id
                                 )
                                 
-                                filters = {}
-                                if rag_category != "전체":
-                                    filters['category'] = rag_category
-                                    
-                                if rag_period != "전체":
-                                    period_days = {"최근 7일": 7, "최근 14일": 14, "최근 30일": 30}
-                                    cutoff_date = (datetime.utcnow() - timedelta(days=period_days[rag_period])).strftime("%Y-%m-%d")
-                                    filters['cutoff_date'] = cutoff_date
-                                    
-                                response = agent.answer(rag_query, filters)
-                                
-                                # (5) 결과 출력
-                                st.write(response.answer)
-                                
-                                # Source Citation
-                                if response.citations:
-                                    st.markdown("---")
-                                    st.markdown("**📑 참고 자료 (근거)**")
-                                    for idx, c in enumerate(response.citations):
-                                        link = f" [📎 원본]({c.url})" if c.url else ""
-                                        date_str = f" ({c.date})" if c.date else ""
-                                        st.markdown(f"**[{idx+1}] {c.title}{date_str}**{link}\n> {c.excerpt}")
-                                
-                                # 디버그 로그
-                                with st.expander("🛠️ RAG 검색 로그 보기"):
-                                    st.json(response.retrieval_log)
-                                
-                                st.session_state.rag_messages.append({'query': rag_query, 'response': response.answer})
-                                
-                                # DB 저장
-                                if user_id:
-                                    save_rag_chat(user_id, rag_query, response.answer)
-                                    
-                            except Exception as e:
-                                st.error(f"RAG 검색/답변 중 오류가 발생했습니다: {e}")
+                        except Exception as e:
+                            st.error(f"RAG 검색/답변 중 오류가 발생했습니다: {e}")
+                            
+            # 상태 변경 반영을 위해 리런
+            st.rerun()
 
 import sys
 def _dbg(msg):

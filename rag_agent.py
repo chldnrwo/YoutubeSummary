@@ -37,7 +37,7 @@ class RAGAgent:
         self.api_key = api_key
         self.user_id = user_id
         
-    def answer(self, query: str, filters: dict = None) -> AgentResponse:
+    def answer(self, query: str, filters: dict = None, chat_history: list = None) -> AgentResponse:
         start_time = time.time()
         retrieval_log = []
         genai.configure(api_key=self.api_key)
@@ -131,15 +131,24 @@ class RAGAgent:
                 processing_time_ms=processing_time
             )
             
+        history_text = ""
+        if chat_history:
+            recent_history = chat_history[-5:]
+            for h in recent_history:
+                history_text += f"User: {h['query']}\nAssistant: {h['response']}\n\n"
+            
         final_prompt = f"""당신은 사용자의 개인 지식베이스(세컨드 브레인)를 관리하는 AI 비서입니다.
-아래 제공된 [관련 지식 문서]들만을 바탕으로 사용자의 [질문]에 상세하고 친절하게 답변해주세요.
-여러 문서에 걸친 공통점이나 트렌드를 묻는 질문이라면, 각 문서의 핵심을 종합하여 패턴과 공통 메시지를 분석해주세요.
+아래 제공된 [관련 지식 문서]들만을 바탕으로 사용자의 [현재 질문]에 상세하고 친절하게 답변해주세요.
+이전 대화의 문맥(Context)이 있다면, 이를 참고하여 답변하세요 (예: 대명사가 무엇을 지칭하는지 등).
 문서에 없는 내용은 지어내지 말고, "제공된 지식베이스에는 관련 내용이 없습니다"라고 답변하세요.
+
+[이전 대화 기록]
+{history_text if history_text else "없음"}
 
 [관련 지식 문서 ({len(results[:10])}개)]
 {context_text}
 
-[질문]
+[현재 질문]
 {query}
 """
         try:
