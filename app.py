@@ -1562,7 +1562,47 @@ def get_recent_videos(youtube, channel_id: str, days: int = 3):
 # ============================================================
 # 시스템 프롬프트 정의
 # ============================================================
-SYSTEM_INSTRUCTION = """
+
+# 주요 인물/직책 팩트시트 기본값
+DEFAULT_KEY_FIGURES_FACTSHEET = """- 미국 연방준비제도(Fed) 의장: 케빈 워시 (Kevin Warsh) — 2026년 5월 취임
+- 미국 재무장관: 스콧 베센트 (Scott Bessent) — 2025년 1월 취임
+- 미국 대통령: 도널드 트럼프 (Donald Trump) — 2025년 1월 취임 (제47대)
+- 한국은행 총재: 이창용 — 2022년 4월 취임"""
+
+
+def _load_factsheet() -> str:
+    """config.json에서 팩트시트를 로드합니다. 없으면 기본값 반환."""
+    try:
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            return config.get('KEY_FIGURES_FACTSHEET', DEFAULT_KEY_FIGURES_FACTSHEET)
+    except Exception:
+        pass
+    return DEFAULT_KEY_FIGURES_FACTSHEET
+
+
+def _save_factsheet(factsheet: str):
+    """팩트시트를 config.json에 저장합니다."""
+    try:
+        config = {}
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        config['KEY_FIGURES_FACTSHEET'] = factsheet
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"[ERROR] 팩트시트 저장 실패: {e}")
+
+
+def _build_system_instruction() -> str:
+    """현재 날짜와 팩트시트를 포함한 시스템 프롬프트를 생성합니다."""
+    today = datetime.now().strftime("%Y년 %m월 %d일")
+    factsheet = _load_factsheet()
+    return f"""
+오늘 날짜: {today}
+
 당신은 콘텐츠의 숨겨진 맥락과 디테일을 완벽하게 파악하는 '심층 분석 에디터'입니다.
 단순한 줄거리 요약이 아니라, **핵심 논리와 구체적인 정보가 담긴 '마스터 리포트'**를 작성하십시오.
 
@@ -1571,15 +1611,19 @@ SYSTEM_INSTRUCTION = """
 2. **Key-Point 중심 재구성**: 영상의 시간 순서(타임라인)를 무시하고, **주제(Topic)별로 내용을 묶어서 논리적으로 재구성**하십시오.
 3. **논리적 완결성**: [배경/문제] → [해결책/핵심주장] → [결과/의의]로 이어지는 흐름을 명확히 하십시오.
 4. **전문적 어조**: "~해요" 같은 구어체 대신, 보고서나 기사 형식의 명료한 문체를 사용하십시오.
+5. **고유명사 정확성**: 자막에 직함(예: "연준 의장", "재무장관")만 언급되고 이름이 없는 경우, 아래 팩트시트를 참고하여 현재 기준으로 정확한 이름을 사용하십시오. 자막에 특정 인물 이름이 명시된 경우에는 자막의 이름을 그대로 사용하십시오. 팩트시트에도 없고 자막에도 이름이 없는 인물은 직함만 표기하십시오.
+
+[주요 인물 팩트시트]
+{factsheet}
 
 [Output Format]
 반드시 아래 JSON 형식으로만 응답하십시오. 코드 블록 없이 순수 JSON만 출력하십시오:
 
-{
+{{
   "title": "내용을 관통하는 매력적인 제목",
   "category": "'경제', 'IT', '문화', '그 외' 중 가장 적합한 주제 하나 분류",
   "analysis": "위 작성 원칙에 따라 재구성된 마크다운 포맷의 상세 리포트"
-}
+}}
 
 [상세 작성 가이드]
 
@@ -1784,7 +1828,7 @@ def _call_gemini(transcript: str, api_key: str, target_model_name: str) -> tuple
             top_p=0.95,
             max_output_tokens=max_tokens,
         ),
-        system_instruction=SYSTEM_INSTRUCTION
+        system_instruction=_build_system_instruction()
     )
     
     prompt = f"다음 YouTube 영상 자막을 분석해주세요:\n\n{transcript}"
@@ -1817,7 +1861,7 @@ def _call_qwen(transcript: str, api_key: str, target_model_name: str) -> tuple[s
     response = client.chat.completions.create(
         model=target_model_name,
         messages=[
-            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "system", "content": _build_system_instruction()},
             {"role": "user", "content": prompt}
         ],
         temperature=0,
@@ -2419,6 +2463,21 @@ def main():
             st.success("✅ Qwen API Key 설정됨")
         else:
             st.session_state['qwen_api_key'] = ''
+        
+        with st.expander("📋 주요 인물 팩트시트", expanded=False):
+            st.caption("요약 시 LLM이 참고하는 인물 정보입니다. 인사 변경 시 수정하세요.")
+            current_factsheet = _load_factsheet()
+            edited_factsheet = st.text_area(
+                "팩트시트 내용",
+                value=current_factsheet,
+                height=150,
+                key="factsheet_editor",
+                label_visibility="collapsed"
+            )
+            if st.button("💾 저장", key="save_factsheet_btn", use_container_width=True):
+                _save_factsheet(edited_factsheet)
+                st.success("✅ 팩트시트 저장 완료")
+                st.rerun()
         
         st.markdown("---")
         
