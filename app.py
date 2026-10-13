@@ -2517,9 +2517,27 @@ def main():
         
             # 저장된 분석 목록 (로그인 시만 표시)
             if is_logged_in and user_id:
-                col_header, col_refresh = st.columns([5, 1])
+                col_header, col_readall, col_refresh = st.columns([5, 1, 1])
                 with col_header:
                     st.header("📚 저장된 분석")
+                with col_readall:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("✅", key="mark_all_read", help="모두 읽음 처리"):
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                                INSERT OR IGNORE INTO read_insights (user_id, insight_id)
+                                SELECT ?, id FROM insights WHERE user_id = ?
+                            """, (user_id, user_id))
+                            conn.commit()
+                            conn.close()
+                            st.session_state['viewed_insights'] = get_read_insight_ids(user_id)
+                            st.toast("✅ 모든 분석을 읽음 처리했습니다.")
+                        except Exception as e:
+                            print(f"[DB ERROR] 모두 읽음 처리 실패: {e}")
+                            st.toast("❌ 읽음 처리 중 오류가 발생했습니다.")
+                        st.rerun()
                 with col_refresh:
                     st.markdown("<br>", unsafe_allow_html=True)
                     if st.button("🔄", key="refresh_insights", help="분석 목록 새로고침"):
