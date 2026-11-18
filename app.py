@@ -1810,7 +1810,7 @@ def _call_gemini(transcript: str, api_key: str, target_model_name: str) -> tuple
     """Gemini API를 호출하여 응답 텍스트를 반환합니다."""
     genai.configure(api_key=api_key)
     
-    # Gemini 2.5 모델은 thinking 토큰이 max_output_tokens에 포함됨
+    # thinking 토큰 및 긴 출력 대응 max_tokens 설정
     transcript_len = len(transcript)
     if transcript_len <= 10000:
         max_tokens = 16384
@@ -1833,6 +1833,18 @@ def _call_gemini(transcript: str, api_key: str, target_model_name: str) -> tuple
     
     prompt = f"다음 YouTube 영상 자막을 분석해주세요:\n\n{transcript}"
     response = model.generate_content(prompt)
+    
+    # 토큰 비용 추적 및 모니터링 로그 (1주일간 월간 비용 산출용)
+    try:
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            prompt_tokens = getattr(usage, "prompt_token_count", 0)
+            candidates_tokens = getattr(usage, "candidates_token_count", 0)
+            total_tokens = getattr(usage, "total_token_count", 0)
+            print(f"[TOKEN USAGE] Model: {target_model_name} | Prompt: {prompt_tokens} tokens, Candidates: {candidates_tokens} tokens, Total: {total_tokens} tokens")
+    except Exception as ue:
+        print(f"[TOKEN USAGE] Logging failed: {ue}")
+
     return response.text.strip(), target_model_name
 
 
@@ -1949,14 +1961,17 @@ def analyze_with_gemini(transcript: str, api_key: str, force_model: str = None, 
             print(f"[DEBUG] Qwen API error: {e}")
             raise
     
-    # Gemini 모델 처리 (기존 로직)
+    # Gemini 모델 처리
     if force_model == "gemini-2.5-flash":
         target_model_name = "gemini-2.5-flash"
-    elif force_model == "gemini-2.5-flash-lite":
-        target_model_name = "gemini-2.5-flash-lite"
+    elif force_model in ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite"):
+        target_model_name = force_model
+    elif force_model:
+        target_model_name = force_model
     else:
         # 자막 길이에 따라 비용 효율적인 모델 선택 (30,000자 기준 자동 모드)
-        target_model_name = "gemini-2.5-flash-lite" if len(transcript) <= 30000 else "gemini-2.5-flash"
+        # 1차 업그레이드 전략: 일반 영상(<=3만 자)은 신형 3.1 Flash-Lite, 긴 대본(>3만 자)은 2.5 Flash
+        target_model_name = "gemini-3.1-flash-lite" if len(transcript) <= 30000 else "gemini-2.5-flash"
     
     print(f"[DEBUG] 자막 길이: {len(transcript)}자 -> 사용 모델: {target_model_name}, Gemini")
     
@@ -2806,7 +2821,7 @@ def main():
             if st.session_state.get('show_reanalyze'):
                 st.markdown("---")
                 st.info("💡 모델을 변경하여 이 영상을 다시 분석하고 결과를 덮어씁니다.")
-                _reanalyze_options = ["Gemini 2.5 Flash (고품질)", "Gemini 2.5 Flash Lite (저비용)"]
+                _reanalyze_options = ["Gemini 3.1 Flash Lite (신형 고효율)", "Gemini 2.5 Flash (고품질/긴 대본)"]
                 if st.session_state.get('qwen_api_key'):
                     _reanalyze_options.append("Qwen Flash (저비용, 고성능)")
                 re_model_opt = st.selectbox(
@@ -2818,10 +2833,10 @@ def main():
                 if st.button("🚀 선택한 모델로 다시 돌리기", type="primary"):
                     if "Qwen" in re_model_opt:
                         force_val = "qwen-flash"
-                    elif "Flash (" in re_model_opt:
+                    elif "2.5 Flash" in re_model_opt or "고품질" in re_model_opt:
                         force_val = "gemini-2.5-flash"
                     else:
-                        force_val = "gemini-2.5-flash-lite"
+                        force_val = "gemini-3.1-flash-lite"
                     api_key = st.session_state.get('api_key', '')
                     if not api_key and force_val not in QWEN_MODELS:
                         st.error("API Key가 설정되어 있지 않습니다.")
@@ -2875,7 +2890,7 @@ def main():
         col_model, col_btn = st.columns([4, 1])
         with col_model:
             # Qwen API 키가 있으면 Qwen 옵션도 표시
-            _model_options = ["자동 (길이 기준 최적화)", "Gemini 2.5 Flash (고품질, 권장)", "Gemini 2.5 Flash Lite (저비용)"]
+            _model_options = ["자동 (길이 최적화: 3.1 Flash Lite / 2.5 Flash)", "Gemini 3.1 Flash Lite (신형 고효율, 권장)", "Gemini 2.5 Flash (고품질/긴 대본)"]
             if st.session_state.get('qwen_api_key'):
                 _model_options.append("Qwen Flash (저비용, 고성능)")
             selected_model_option = st.selectbox(
@@ -2917,9 +2932,9 @@ def main():
                     force_model_val = None
                     if "Qwen" in selected_model_option:
                         force_model_val = "qwen-flash"
-                    elif "Flash Lite" in selected_model_option:
-                        force_model_val = "gemini-2.5-flash-lite"
-                    elif "Flash" in selected_model_option:
+                    elif "3.1 Flash Lite" in selected_model_option or "Flash Lite" in selected_model_option:
+                        force_model_val = "gemini-3.1-flash-lite"
+                    elif "2.5 Flash" in selected_model_option or "고품질" in selected_model_option:
                         force_model_val = "gemini-2.5-flash"
                         
                     title, category, analysis_result, model_name = analyze_with_gemini(
