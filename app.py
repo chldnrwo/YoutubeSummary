@@ -2821,7 +2821,11 @@ def main():
             if st.session_state.get('show_reanalyze'):
                 st.markdown("---")
                 st.info("💡 모델을 변경하여 이 영상을 다시 분석하고 결과를 덮어씁니다.")
-                _reanalyze_options = ["Gemini 3.1 Flash Lite (신형 고효율)", "Gemini 2.5 Flash (고품질/긴 대본)"]
+                _reanalyze_options = [
+                    "Gemini 3.1 Flash Lite (신형 고효율)",
+                    "Gemini 2.5 Flash Lite (초경량)",
+                    "Gemini 2.5 Flash (고품질/긴 대본)"
+                ]
                 if st.session_state.get('qwen_api_key'):
                     _reanalyze_options.append("Qwen Flash (저비용, 고성능)")
                 re_model_opt = st.selectbox(
@@ -2833,6 +2837,8 @@ def main():
                 if st.button("🚀 선택한 모델로 다시 돌리기", type="primary"):
                     if "Qwen" in re_model_opt:
                         force_val = "qwen-flash"
+                    elif "2.5 Flash Lite" in re_model_opt:
+                        force_val = "gemini-2.5-flash-lite"
                     elif "2.5 Flash" in re_model_opt or "고품질" in re_model_opt:
                         force_val = "gemini-2.5-flash"
                     else:
@@ -2890,7 +2896,12 @@ def main():
         col_model, col_btn = st.columns([4, 1])
         with col_model:
             # Qwen API 키가 있으면 Qwen 옵션도 표시
-            _model_options = ["자동 (길이 최적화: 3.1 Flash Lite / 2.5 Flash)", "Gemini 3.1 Flash Lite (신형 고효율, 권장)", "Gemini 2.5 Flash (고품질/긴 대본)"]
+            _model_options = [
+                "자동 (길이 최적화: 3.1 Flash Lite / 2.5 Flash)",
+                "Gemini 3.1 Flash Lite (신형 고효율, 권장)",
+                "Gemini 2.5 Flash Lite (초경량)",
+                "Gemini 2.5 Flash (고품질/긴 대본)"
+            ]
             if st.session_state.get('qwen_api_key'):
                 _model_options.append("Qwen Flash (저비용, 고성능)")
             selected_model_option = st.selectbox(
@@ -2932,8 +2943,10 @@ def main():
                     force_model_val = None
                     if "Qwen" in selected_model_option:
                         force_model_val = "qwen-flash"
-                    elif "3.1 Flash Lite" in selected_model_option or "Flash Lite" in selected_model_option:
+                    elif "3.1 Flash Lite" in selected_model_option:
                         force_model_val = "gemini-3.1-flash-lite"
+                    elif "2.5 Flash Lite" in selected_model_option:
+                        force_model_val = "gemini-2.5-flash-lite"
                     elif "2.5 Flash" in selected_model_option or "고품질" in selected_model_option:
                         force_model_val = "gemini-2.5-flash"
                         
